@@ -1,20 +1,14 @@
-from __future__ import annotations
 from flask import Flask, jsonify, request, send_from_directory
-from pathlib import Path
-import numpy as np, pandas as pd
-from sklearn.preprocessing import StandardScaler
+import numpy as np
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error
-from echomarket import (
-    TICKERS,
-    prices,
-    gdelt,
-    webhose_news,
-    market_frame,
-    forecast_bundle,
-)
+from echomarket import FEATURES, TICKERS, all_news, forecast_bundle, market_frame, prices
 
 app = Flask(__name__, static_folder="frontend/dist", static_url_path="")
+
+
+def records(df):
+    return df.replace({np.nan: None}).to_dict("records")
 
 
 @app.get("/")
@@ -33,29 +27,16 @@ def dashboard():
     if ticker not in TICKERS:
         return jsonify({"error": "Unsupported ticker"}), 400
     try:
-        raw = prices(ticker)
-        frame = market_frame(ticker)
-        news = gdelt(ticker)
-        archive = webhose_news(ticker)
-        if not archive.empty:
-            news = pd.concat([news, archive], ignore_index=True).drop_duplicates(
-                "title"
-            )
-        payload = forecast_bundle(ticker, frame, news)
-        hist = raw.reset_index()
-        hist["Date"] = pd.to_datetime(hist.Date).dt.strftime("%Y-%m-%d")
+        news = all_news(ticker)
+        hist = prices(ticker).tail(260).reset_index()
+        hist["Date"] = hist.Date.dt.strftime("%Y-%m-%d")
+        latest = news.sort_values("date", ascending=False).head(40)
         return jsonify(
             {
                 "ticker": ticker,
-                "price_history": hist.tail(260)[["Date", "Close", "Volume"]]
-                .replace({np.nan: None})
-                .to_dict("records"),
-                "news": news.sort_values("date", ascending=False)
-                .head(40)
-                .assign(date=lambda x: x.date.astype(str))
-                .replace({np.nan: None})
-                .to_dict("records"),
-                **payload,
+                "price_history": records(hist[["Date", "Close", "Volume"]]),
+                "news": records(latest.assign(date=latest.date.astype(str))),
+                **forecast_bundle(market_frame(ticker), news),
             }
         )
     except Exception as e:
@@ -68,15 +49,12 @@ def replay():
     if ticker not in TICKERS:
         return jsonify({"error": "Unsupported ticker"}), 400
     try:
-        f = market_frame(ticker)
-        cols = ["ret1", "mom5", "mom20", "vol20", "vol_ratio", "spy5"]
-        X = f[cols]
-        y = f.target5
-        start = max(180, len(f) // 2)
+        f = market_frame(ticker).dropna()
+        X, y = f[FEATURES], f.target5
         out = []
-        for i in range(start, len(f) - 5, 10):
-            m = Ridge(alpha=1).fit(X.iloc[:i], y.iloc[:i])
-            pred = float(m.predict(X.iloc[[i]])[0])
+        for i in range(max(180, len(f) // 2), len(f), 10):
+            # Train only on days whose 5-day outcome was already known on day i.
+            pred = float(Ridge(alpha=1).fit(X.iloc[: i - 5], y.iloc[: i - 5]).predict(X.iloc[[i]])[0])
             actual = float(y.iloc[i])
             out.append(
                 {
@@ -90,18 +68,8 @@ def replay():
             {
                 "ticker": ticker,
                 "forecasts": out,
-                "mae": float(
-                    mean_absolute_error(
-                        [x["actual"] for x in out], [x["predicted"] for x in out]
-                    )
-                )
-                if out
-                else None,
-                "directional_accuracy": float(
-                    np.mean([x["correct_direction"] for x in out])
-                )
-                if out
-                else None,
+                "mae": mean_absolute_error([x["actual"] for x in out], [x["predicted"] for x in out]) if out else None,
+                "directional_accuracy": float(np.mean([x["correct_direction"] for x in out])) if out else None,
             }
         )
     except Exception as e:

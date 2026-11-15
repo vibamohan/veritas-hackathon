@@ -13,7 +13,21 @@ uv run python app.py
 
 Open http://127.0.0.1:5000. Flask serves the React production build and exposes `/api/dashboard`, `/api/replay`, and `/api/health`. For frontend development, run `npm --prefix frontend run dev` in another terminal; Vite proxies API calls to Flask.
 
-The app downloads prices through yfinance and headlines from GDELT, caching files under `data/cache/`. Current prototype uses TF-IDF text similarity and Ridge regression with chronological replay.
+The app downloads prices through yfinance (full history) and live headlines from GDELT, caching files under `data/cache/`. Current prototype uses TF-IDF text similarity and Ridge regression with chronological replay. Data loading and the model live in `echomarket.py`; `app.py` is the Flask API.
+
+## Historical news datasets
+
+Ready-to-use headline files for our tickers are committed in `data/datasets/` (date, title, url, source, ticker), so a fresh clone works with no downloads. A row is kept if the dataset tags it with the ticker or its headline names the company (e.g. "Nvidia", "S&P 500").
+
+| File | Source | Coverage | License |
+| --- | --- | --- | --- |
+| `huggingface.csv` | [oliverwang15/us_stock_news_with_price](https://huggingface.co/datasets/oliverwang15/us_stock_news_with_price) | 2009–2023 | not stated |
+| `kaggle.csv` | [Massive Stock News Analysis DB](https://www.kaggle.com/datasets/miguelaenlle/massive-stock-news-analysis-db-for-nlpbacktests) (Miguel Aenlle) | 2009–2020 | CC0 |
+| `fliarbi.csv` | [Fliar BI Corporate Events 2019–2026](https://fliarbi.com/datasets/corporate-events-2019-2026/), free 7% sample | 2019–2026 | CC BY-NC 4.0 |
+
+To rebuild them, run `uv run python scripts/download_datasets.py`. Kaggle needs a login: download its ZIP manually and save it as `data/datasets/kaggle.zip` first (it is git-ignored), otherwise the committed `kaggle.csv` is kept.
+
+## Webhose (optional)
 
 Download a few upstream Webhose releases into `data/webhose/` with:
 
@@ -21,6 +35,6 @@ Download a few upstream Webhose releases into `data/webhose/` with:
 uv run python scripts/download_webhose_dataset.py --latest 4
 ```
 
-The downloader selects the newest weekly ZIP archives (positive and negative sentiment combined by default). The app reads JSON, JSONL, and CSV files inside those ZIPs as well as loose CSV/JSON/JSONL files. It extracts publication date, title, text, URL, source, and the archive's sentiment label, then finds ticker mentions for historical matching. Keep the number of archives modest for a quick demo; the repository adds new releases over time. Review the [Webhose dataset repository](https://github.com/Webhose/financial-news-dataset) and its [terms of use](https://github.com/Webhose/free-news-datasets/blob/master/tou.MD) before use: the dataset is described as available for academic, research, and journalistic purposes.
+The downloader selects the newest weekly ZIP archives (positive and negative sentiment combined by default). The app reads JSON, JSONL, and CSV files inside those ZIPs as well as loose CSV/JSON/JSONL files. It extracts publication date, title, URL, and source, keeping articles that mention the ticker or company name. Keep the number of archives modest for a quick demo; the repository adds new releases over time. Review the [Webhose dataset repository](https://github.com/Webhose/financial-news-dataset) and its [terms of use](https://github.com/Webhose/free-news-datasets/blob/master/tou.MD) before use: the dataset is described as available for academic, research, and journalistic purposes.
 
 This is an educational research prototype, not investment advice. GDELT coverage and Webhose article ticker/date mapping may be incomplete; predictions are experimental.
