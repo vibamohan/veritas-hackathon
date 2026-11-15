@@ -33,8 +33,17 @@ CACHE = Path("data/cache")  # downloaded prices/news are cached here (git-ignore
 CACHE.mkdir(parents=True, exist_ok=True)
 
 TICKERS = ["NVDA", "TSLA", "AAPL", "SPY"]
-NAMES = {"NVDA": "Nvidia", "TSLA": "Tesla", "AAPL": "Apple", "SPY": "S&P 500"}  # used to match headlines
+NAMES = {
+    "NVDA": "Nvidia",
+    "TSLA": "Tesla",
+    "AAPL": "Apple",
+    "SPY": "S&P 500",
+    "DIS": "Walt Disney",
+}  # used to match headlines and broaden live news searches
+NEWS_ALIASES = {"DIS": ["Disney"]}
 NEWS_COLS = ["date", "title", "url", "source"]  # every news loader returns these columns
+COMPANY_NAME_CACHE = CACHE / "company_names.json"
+_company_name_cache = None
 
 # Price features for the direction model: 1-day return, 5/20-day momentum,
 # 20-day volatility, volume vs its 20-day average, and SPY's 5-day return.
@@ -49,8 +58,46 @@ def ridge_model(alpha=1.0):
 
 def mentions(ticker):
     """Regex for the ticker or known company name appearing in a headline."""
-    name = NAMES.get(ticker, ticker)
-    return rf"(?<![A-Za-z0-9]){re.escape(ticker)}(?![A-Za-z0-9])|(?i:\b{re.escape(name)}\b)"
+    terms = [ticker, *company_names(ticker), *NEWS_ALIASES.get(ticker, [])]
+    return "|".join(
+        rf"(?<![A-Za-z0-9]){re.escape(term)}(?![A-Za-z0-9])"
+        if term == ticker
+        else rf"(?i:\b{re.escape(term)}\b)"
+        for term in terms
+    )
+
+
+def company_names(ticker):
+    """Return known and Yahoo Finance company names for any valid ticker.
+
+    Yahoo lookups are cached on disk for seven days. If metadata is unavailable, the ticker
+    remains a usable search term and the built-in names for the default symbols still apply.
+    """
+    global _company_name_cache
+    if _company_name_cache is None:
+        try:
+            _company_name_cache = json.loads(COMPANY_NAME_CACHE.read_text())
+        except (OSError, ValueError):
+            _company_name_cache = {}
+
+    ticker = ticker.upper()
+    cached = _company_name_cache.get(ticker, {})
+    names = [NAMES.get(ticker)]
+    names.extend(cached.get("names", []))
+    if ticker not in NAMES and (
+        not cached or time.time() - cached.get("updated_at", 0) >= 7 * 24 * 3600
+    ):
+        try:
+            info = yf.Ticker(ticker).get_info()
+            fetched = [info.get("longName"), info.get("shortName")]
+            fetched = list(dict.fromkeys(str(name).strip() for name in fetched if name and str(name).strip()))
+            names.extend(fetched)
+            _company_name_cache[ticker] = {"names": fetched, "updated_at": time.time()}
+            COMPANY_NAME_CACHE.write_text(json.dumps(_company_name_cache))
+        except Exception:
+            pass  # News search can still use the ticker and any cached/static names.
+
+    return list(dict.fromkeys(name for name in names if name))
 
 
 def valid_ticker(ticker):
@@ -119,8 +166,10 @@ def gdelt(ticker, days=90):
     if cache_is_fresh or failed_recently:
         return cached
 
+    search_terms = [ticker, *(f'"{name}"' for name in company_names(ticker)), *NEWS_ALIASES.get(ticker, [])]
+    query = f"({' OR '.join(search_terms)}) sourcelang:eng"
     articles = _fetch_gdelt_articles({
-        "query": f'({ticker} OR "{NAMES.get(ticker, ticker)}") sourcelang:eng',
+        "query": query,
         "mode": "ArtList",
         "format": "json",
         "maxrecords": 250,
