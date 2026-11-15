@@ -1,7 +1,6 @@
 .venv/
 node_modules/
 frontend/dist/
-uv.lock
 __pycache__/
 data/cache/
 data/datasets/*.zip

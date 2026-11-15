@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: echomarket
+    runtime: python
+    plan: free
+    branch: main
+    autoDeployTrigger: checksPass
+    buildCommand: pip install uv && uv sync --locked && npm --prefix frontend ci && npm --prefix frontend run build
+    startCommand: uv run gunicorn --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 180 app:app
+    healthCheckPath: /api/health
