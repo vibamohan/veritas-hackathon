@@ -5,14 +5,36 @@
 //   /api/replay     validation results for the direction model
 // and renders one component per panel. Charts are drawn with Plotly into <div id="..."> elements.
 
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import Plotly from "plotly.js-dist-min";
-import { Activity, RefreshCw, TrendingUp, Newspaper, History, ChartNoAxesCombined, Waves } from "lucide-react";
+import {
+  Activity,
+  RefreshCw,
+  TrendingUp,
+  Newspaper,
+  History,
+  ChartNoAxesCombined,
+  Waves,
+} from "lucide-react";
 import "./style.css";
 
 const TICKERS = ["NVDA", "TSLA", "AAPL", "SPY"];
 const PLOT_CONFIG = { displayModeBar: false, responsive: true };
+
+// Sidebar shortcuts: [element id on the page, label].
+const SECTIONS = [
+  ["turbulence", "Turbulence outlook"],
+  ["price", "Price chart"],
+  ["forecast", "Direction forecast"],
+  ["matches", "Similar past news"],
+  ["validation", "Model validation"],
+  ["headlines", "Latest headlines"],
+];
+
+function scrollToSection(id) {
+  document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
+}
 
 // ---------------------------------------------------------------------------
 // Formatting helpers (values from the API are fractions: 0.05 means 5%)
@@ -83,7 +105,12 @@ function drawGauge(prediction) {
       ],
     },
   };
-  Plotly.newPlot("gauge", [gauge], { margin: { t: 18, b: 5, l: 20, r: 20 }, paper_bgcolor: "white" }, PLOT_CONFIG);
+  Plotly.newPlot(
+    "gauge",
+    [gauge],
+    { margin: { t: 18, b: 5, l: 20, r: 20 }, paper_bgcolor: "white" },
+    PLOT_CONFIG,
+  );
 }
 
 // Validation forecasts vs what actually happened, plus the "always up" baseline.
@@ -116,37 +143,70 @@ function drawReplayChart(forecasts) {
 // App: state, data loading, layout
 // ---------------------------------------------------------------------------
 
+async function fetchJson(url) {
+  const response = await fetch(url);
+  const body = await response.json();
+  if (!response.ok) throw Error(body.error);
+  return body;
+}
+
+// Both endpoints for one ticker, requested in parallel.
+async function fetchTicker(ticker) {
+  const [data, replay] = await Promise.all([
+    fetchJson(`/api/dashboard?ticker=${ticker}`),
+    fetchJson(`/api/replay?ticker=${ticker}`),
+  ]);
+  return { data, replay };
+}
+
 function App() {
   const [ticker, setTicker] = useState("NVDA");
   const [data, setData] = useState(null); // /api/dashboard response
   const [replay, setReplay] = useState(null); // /api/replay response
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const loaded = useRef({}); // ticker -> { data, replay }, so switching back is instant
+  const current = useRef(ticker); // the ticker on screen, to ignore responses that arrive too late
 
-  async function fetchJson(url) {
-    const response = await fetch(url);
-    const body = await response.json();
-    if (!response.ok) throw Error(body.error);
-    return body;
+  function show(result) {
+    setData(result.data);
+    setReplay(result.replay);
   }
 
-  async function load() {
-    setLoading(true);
+  async function load(force = false) {
+    current.current = ticker;
     setError("");
+    if (!force && loaded.current[ticker]) {
+      show(loaded.current[ticker]);
+      return;
+    }
+    setLoading(true);
     try {
-      setData(await fetchJson(`/api/dashboard?ticker=${ticker}`));
-      setReplay(await fetchJson(`/api/replay?ticker=${ticker}`));
+      const result = await fetchTicker(ticker);
+      loaded.current[ticker] = result;
+      if (current.current === ticker) show(result); // the user may have switched again meanwhile
     } catch (e) {
-      setError(e.message);
+      if (current.current === ticker) setError(e.message);
     } finally {
-      setLoading(false);
+      if (current.current === ticker) setLoading(false);
     }
   }
 
-  // Reload whenever the ticker changes.
+  // Load whenever the ticker changes.
   useEffect(() => {
     load();
   }, [ticker]);
+
+  // After the first page is shown, quietly fetch the other tickers so switching is instant.
+  useEffect(() => {
+    if (!data) return;
+    TICKERS.filter((t) => !loaded.current[t]).forEach(
+      (t) =>
+        fetchTicker(t)
+          .then((result) => (loaded.current[t] = result))
+          .catch(() => {}), // a failed prefetch is retried when the user picks that ticker
+    );
+  }, [data !== null]);
 
   // Redraw the charts whenever new data arrives.
   useEffect(() => {
@@ -159,15 +219,15 @@ function App() {
   return (
     <>
       <Sidebar ticker={ticker} onChange={setTicker} />
-      <main>
+      <main className={loading ? "loading" : ""}>
         <header>
           <div>
             <div className="eyebrow">MARKET OVERVIEW / {new Date().toLocaleDateString()}</div>
             <h1>{ticker} Intelligence</h1>
           </div>
-          <button onClick={load}>
+          <button onClick={() => load(true)}>
             <RefreshCw size={15} />
-            {loading ? "Loading…" : "Refresh data"}
+            {loading ? `Loading ${ticker}…` : "Refresh data"}
           </button>
         </header>
         {error && <div className="error">{error}</div>}
@@ -210,7 +270,7 @@ function Sidebar({ ticker, onChange }) {
       <div className="brand">
         ◉ Echo<span>Market</span>
       </div>
-      <p className="muted">HISTORICAL EVENT INTELLIGENCE</p>
+      <p className="muted">VOLATILITY OUTLOOK FOR EVERYDAY INVESTORS</p>
       <label>ASSET</label>
       <select value={ticker} onChange={(e) => onChange(e.target.value)}>
         {TICKERS.map((t) => (
@@ -231,13 +291,14 @@ function Sidebar({ ticker, onChange }) {
         <button type="submit">Load stock</button>
         {tickerError && <small className="ticker-error">{tickerError}</small>}
       </form>
-      <div className="side-note">
-        Live market data
-        <br />
-        GDELT headlines
-        <br />
-        Historical news datasets
-      </div>
+      <label>JUMP TO</label>
+      <nav className="nav">
+        {SECTIONS.map(([id, label]) => (
+          <button key={id} onClick={() => scrollToSection(id)}>
+            {label}
+          </button>
+        ))}
+      </nav>
       <p className="muted bottom">
         RESEARCH PREVIEW
         <br />
@@ -262,13 +323,28 @@ function Head({ icon, title, sub }) {
   );
 }
 
+// Four headline numbers at the top of the page.
 function MetricTiles({ data }) {
   const history = data?.price_history || [];
+  const t = data?.turbulence;
+  const daysToEarnings = t?.drivers?.days_to_earnings;
   const tiles = [
     ["LATEST CLOSE", money(history.at(-1)?.Close), "5 day momentum " + pct(data?.momentum_5d)],
-    ["5 DAY MODEL OUTLOOK", pct(data?.prediction), "Experimental direction model"],
-    ["HISTORICAL MATCHES", (data?.matches || []).length, "Dated news events"],
-    ["POSITIVE MATCH RATE", pct(data?.positive_match_rate), "Among closest events"],
+    [
+      "TURBULENCE · NEXT 5 DAYS",
+      t ? wholePct(t.probability) : "—",
+      t ? (t.probability >= 0.5 ? "Turbulent week likely" : "Calm week likely") : "Only for NVDA, TSLA, AAPL, SPY",
+    ],
+    [
+      "NEXT EARNINGS",
+      !t ? "—" : daysToEarnings == null ? "None" : plural(daysToEarnings, "trading day"),
+      !t
+        ? "Only for the four preset stocks"
+        : daysToEarnings == null
+          ? "Index funds don't report earnings"
+          : "Reports often cause big moves",
+    ],
+    ["5 DAY DIRECTION", pct(data?.prediction), "Experimental · did not beat “always up”"],
   ];
   return (
     <section className="metrics">
@@ -285,8 +361,12 @@ function MetricTiles({ data }) {
 
 function PricePanel() {
   return (
-    <article className="panel chart">
-      <Head icon={<ChartNoAxesCombined />} title="Price performance" sub="Daily adjusted close · last 12 months" />
+    <article className="panel chart" id="price">
+      <Head
+        icon={<ChartNoAxesCombined />}
+        title="Price performance"
+        sub="Daily adjusted close · last 12 months"
+      />
       <div id="priceChart" />
     </article>
   );
@@ -294,8 +374,12 @@ function PricePanel() {
 
 function ForecastPanel({ data }) {
   return (
-    <article className="panel forecast">
-      <Head icon={<Activity />} title="Prediction model" sub="Experimental: did not beat “always up” in testing" />
+    <article className="panel forecast" id="forecast">
+      <Head
+        icon={<Activity />}
+        title="Prediction model"
+        sub="Experimental: did not beat “always up” in testing"
+      />
       <div className="gauge" id="gauge" />
       <div className="baseline">
         <span>Market only</span>
@@ -309,8 +393,12 @@ function ForecastPanel({ data }) {
 // Past days whose headlines were most similar to today's, and what the stock did next.
 function MatchesPanel({ matches }) {
   return (
-    <article className="panel matches">
-      <Head icon={<History />} title="Similar historical events" sub="Context and subsequent five-day return" />
+    <article className="panel matches" id="matches">
+      <Head
+        icon={<History />}
+        title="Similar historical events"
+        sub="Context and subsequent five-day return"
+      />
       {matches.map((m) => (
         <div className="match" key={m.date}>
           <div className="headline">{m.headlines}</div>
@@ -337,7 +425,7 @@ function ReplayPanel({ replay }) {
   ];
   const current = replay?.metrics?.current_model;
   return (
-    <article className="panel replay">
+    <article className="panel replay" id="validation">
       <Head icon={<TrendingUp />} title="Validation · 5-day horizon" sub={subtitle} />
       <div className="replay-stats">
         {rows.map(([key, label]) => (
@@ -348,8 +436,8 @@ function ReplayPanel({ replay }) {
         ))}
       </div>
       <div className="fine">
-        {replay?.architecture} · RMSE {pct(current?.rmse)} · {current?.samples || 0} validation forecasts, sampled
-        every 5 trading days
+        {replay?.architecture} · RMSE {pct(current?.rmse)} · {current?.samples || 0} validation forecasts,
+        sampled every 5 trading days
       </div>
       <div id="replayChart" />
     </article>
@@ -358,8 +446,12 @@ function ReplayPanel({ replay }) {
 
 function HeadlinesPanel({ news, count }) {
   return (
-    <section className="panel headlines">
-      <Head icon={<Newspaper />} title="Latest financial coverage" sub="GDELT live feed + historical news datasets" />
+    <section className="panel headlines" id="headlines">
+      <Head
+        icon={<Newspaper />}
+        title="Latest financial coverage"
+        sub="GDELT live feed + historical news datasets"
+      />
       <div className="tag">{count || 0} ARTICLES</div>
       {news.slice(0, 12).map((n, i) => (
         <div className="newsitem" key={i}>
@@ -394,7 +486,9 @@ function turbulenceTips(t, ticker) {
     tips.push(`Next earnings report in ${days} trading days. Volatility usually rises around the report.`);
   }
   if (vix > 0.2) {
-    tips.push(`Market-wide fear (VIX) is ${signedPct(vix)} above normal, so most stocks are likely to swing, not just ${ticker}.`);
+    tips.push(
+      `Market-wide fear (VIX) is ${signedPct(vix)} above normal, so most stocks are likely to swing, not just ${ticker}.`,
+    );
   }
   tips.push(
     t.probability >= 0.5
@@ -421,7 +515,7 @@ function Turbulence({ t, ticker }) {
   const otherDaily = turbulent ? moves.calm_week_daily : moves.turbulent_week_daily;
 
   return (
-    <section className="panel turbulence">
+    <section className="panel turbulence" id="turbulence">
       <Head
         icon={<Waves />}
         title={`Turbulence outlook · next ${t.horizon_days} trading days`}
@@ -451,18 +545,25 @@ function Turbulence({ t, ticker }) {
         <div className="turb-box">
           <h3>What this means in dollars</h3>
           <p>
-            {ticker} usually moves about <b>{plusMinusPct(moves.normal_daily)}</b> a day. Over the last 3 years it
-            averaged <b>{plusMinusPct(moves.turbulent_week_daily)}</b> a day in turbulent weeks and{" "}
+            {ticker} usually moves about <b>{plusMinusPct(moves.normal_daily)}</b> a day. Over the last 3
+            years it averaged <b>{plusMinusPct(moves.turbulent_week_daily)}</b> a day in turbulent weeks and{" "}
             <b>{plusMinusPct(moves.calm_week_daily)}</b> in calm weeks.
           </p>
           <label className="amount">
             If you have $
-            <input type="number" min="0" step="100" value={amount} onChange={(e) => setAmount(e.target.value)} />{" "}
+            <input
+              type="number"
+              min="0"
+              step="100"
+              value={amount}
+              onChange={(e) => setAmount(e.target.value)}
+            />{" "}
             invested:
           </label>
           <p>
-            a typical day moves it about <b className={turbulent ? "down" : ""}>{plusMinusDollars(invested * expectedDaily)}</b>{" "}
-            in a {turbulent ? "turbulent" : "calm"} week, against {plusMinusDollars(invested * otherDaily)} in a{" "}
+            a typical day moves it about{" "}
+            <b className={turbulent ? "down" : ""}>{plusMinusDollars(invested * expectedDaily)}</b> in a{" "}
+            {turbulent ? "turbulent" : "calm"} week, against {plusMinusDollars(invested * otherDaily)} in a{" "}
             {turbulent ? "calm" : "turbulent"} one.
           </p>
         </div>
@@ -478,10 +579,11 @@ function Turbulence({ t, ticker }) {
       </div>
 
       <p className="fine">
-        Tested accuracy {wholePct(t.test_accuracy)} on held-out 2022–23 data ({wholePct(t.validation_accuracy)} in
-        2015–21 validation) vs {wholePct(t.baseline_test_accuracy)} for “same as last week”. Predicts the size of
-        moves, not their direction. Dollar figures are typical (root-mean-square) daily moves from past data, not
-        guarantees. Educational prototype, not financial advice.
+        Tested accuracy {wholePct(t.test_accuracy)} on held-out 2022–23 data (
+        {wholePct(t.validation_accuracy)} in 2015–21 validation) vs {wholePct(t.baseline_test_accuracy)} for
+        “same as last week”. Predicts the size of moves, not their direction. Dollar figures are typical
+        (root-mean-square) daily moves from past data, not guarantees. Educational prototype, not financial
+        advice.
       </p>
     </section>
   );

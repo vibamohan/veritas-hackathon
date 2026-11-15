@@ -77,11 +77,33 @@ select {
   color: #ffb6bd;
   font-size: 11px;
 }
-.side-note {
-  margin-top: 30px;
+/* Sidebar "Jump to" buttons */
+.nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.nav button {
+  background: transparent;
   color: #c8d2df;
-  line-height: 2.2;
+  text-align: left;
+  padding: 9px 10px;
+  border-radius: 6px;
+  font-weight: 500;
   font-size: 13px;
+}
+.nav button:hover {
+  background: #1c2c45;
+  color: white;
+}
+/* Leave a little space above a section after jumping to it */
+[id] {
+  scroll-margin-top: 16px;
+}
+/* Dim the page while a new ticker loads */
+main.loading {
+  opacity: 0.55;
+  transition: opacity 0.2s;
 }
 .bottom {
   position: absolute;
@@ -294,7 +316,7 @@ footer {
     width: auto;
     padding: 15px 18px;
   }
-  .side-note,
+  .nav,
   .bottom,
   aside label,
   .muted {

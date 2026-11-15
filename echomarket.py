@@ -11,6 +11,7 @@ The volatility ("turbulence") model lives in scripts/volatility.py.
 import io
 import json
 import re
+import threading
 import time
 import zipfile
 from pathlib import Path
@@ -49,6 +50,13 @@ _company_name_cache = None
 # 20-day volatility, volume vs its 20-day average, and SPY's 5-day return.
 FEATURES = ["ret1", "mom5", "mom20", "vol20", "vol_ratio", "spy5"]
 RIDGE_ALPHAS = (0.01, 0.1, 1.0, 10.0, 100.0)  # regularisation strengths tried by the experiment scripts
+
+
+def save_parquet(df, path):
+    """Write via a temporary file, then rename: readers (and other threads) never see a half-written file."""
+    temporary = path.with_name(f"{path.name}.{threading.get_ident()}.tmp")
+    df.to_parquet(temporary)
+    temporary.replace(path)
 
 
 def ridge_model(alpha=1.0):
@@ -127,7 +135,7 @@ def prices(ticker, period="max"):
         df.columns = df.columns.get_level_values(0)
     df.index = pd.to_datetime(df.index).tz_localize(None)
     df.index.name = "Date"
-    df.to_parquet(path)
+    save_parquet(df, path)
     return df
 
 
@@ -139,33 +147,62 @@ GDELT_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
 _gdelt_failed_at = {}  # ticker -> time of the last failed GDELT request
 
 
-def _fetch_gdelt_articles(params):
+def _fetch_gdelt_articles(params, attempts=3):
     """Ask GDELT for articles, retrying network errors. Returns None if it fails.
     A 429 ("too many requests") is not retried: retrying only extends the rate limit."""
-    for attempt in range(3):
+    for attempt in range(attempts):
         try:
             response = requests.get(GDELT_URL, params=params, timeout=15)
             response.raise_for_status()
             return response.json().get("articles", [])
         except (requests.RequestException, ValueError, AttributeError) as error:
             status = getattr(getattr(error, "response", None), "status_code", None)
-            if status == 429 or attempt == 2:
+            if status == 429 or attempt == attempts - 1:
                 return None
             time.sleep(2 ** (attempt + 1))  # wait 2s, then 4s
     return None
 
 
+_gdelt_refreshing = set()  # tickers with a background refresh in progress
+_gdelt_lock = threading.Lock()
+
+
 def gdelt(ticker, days=90):
     """Live headlines from the last `days` days via the free GDELT API.
-    Cached for 30 minutes. If GDELT fails, the last cached copy is used and GDELT is not asked
-    again for 10 minutes, so a rate limit can't slow every page load."""
+
+    GDELT is slow (often 10+ seconds) and rate-limited, so the dashboard never waits for it when
+    any cached copy exists: the cached headlines are returned at once and, if older than 30 minutes,
+    refreshed in a background thread for the next request. Only the very first load waits."""
+    path = CACHE / f"news_{ticker}_{days}.parquet"
+    if not path.exists():
+        return _refresh_gdelt(ticker, days)
+    if time.time() - path.stat().st_mtime > 1800:
+        with _gdelt_lock:
+            start = ticker not in _gdelt_refreshing
+            _gdelt_refreshing.add(ticker)
+        if start:
+            threading.Thread(target=_refresh_gdelt, args=(ticker, days, True), daemon=True).start()
+    return pd.read_parquet(path)
+
+
+def _refresh_gdelt(ticker, days, background=False):
+    """Download headlines from GDELT and update the cache. If GDELT fails, keep the old copy
+    and don't ask again for 10 minutes."""
     path = CACHE / f"news_{ticker}_{days}.parquet"
     cached = pd.read_parquet(path) if path.exists() else pd.DataFrame(columns=NEWS_COLS)
-    cache_is_fresh = path.exists() and time.time() - path.stat().st_mtime < 1800
-    failed_recently = time.time() - _gdelt_failed_at.get(ticker, 0) < 600
-    if cache_is_fresh or failed_recently:
-        return cached
+    try:
+        if time.time() - _gdelt_failed_at.get(ticker, 0) < 600:
+            return cached
+        # Someone is waiting in the foreground: try once. In the background: retry.
+        return _download_gdelt(ticker, days, path, cached, attempts=3 if background else 1)
+    finally:
+        if background:
+            with _gdelt_lock:
+                _gdelt_refreshing.discard(ticker)
 
+
+def _download_gdelt(ticker, days, path, cached, attempts):
+    # Search for the ticker or any known company name / alias (works for custom tickers too).
     search_terms = [ticker, *(f'"{name}"' for name in company_names(ticker)), *NEWS_ALIASES.get(ticker, [])]
     query = f"({' OR '.join(search_terms)}) sourcelang:eng"
     articles = _fetch_gdelt_articles({
@@ -175,7 +212,7 @@ def gdelt(ticker, days=90):
         "maxrecords": 250,
         "timespan": f"{days}d",
         "sort": "HybridRel",
-    })
+    }, attempts)
     if articles is None:
         _gdelt_failed_at[ticker] = time.time()
         return cached
@@ -190,7 +227,7 @@ def gdelt(ticker, days=90):
         for a in articles
     ]
     df = pd.DataFrame(rows, columns=NEWS_COLS).dropna(subset=["date"]).drop_duplicates("title")
-    df.to_parquet(path)
+    save_parquet(df, path)
     return df
 
 

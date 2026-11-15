@@ -4,10 +4,17 @@
   /api/dashboard  prices, headlines, turbulence outlook and the experimental direction forecast
   /api/replay     the direction model's validation results (train through 2019, validate 2020–21)
 
+Speed: each ticker's /api/dashboard and /api/replay response is cached in memory for 10 minutes,
+and all four tickers are computed in a background thread when the server starts, so switching
+tickers in the dashboard doesn't wait for downloads or model training.
+
 Run with:  uv run python app.py   then open http://127.0.0.1:5000
+Set ECHOMARKET_WARMUP=0 to skip the startup pre-loading (e.g. in tests).
 """
 import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
@@ -20,25 +27,67 @@ app = Flask(__name__, static_folder="frontend/dist", static_url_path="")
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Caching
 # ---------------------------------------------------------------------------
 
-_outlook_cache = {"computed_at": 0.0, "by_ticker": {}}
+RESPONSE_TTL = 600  # seconds a computed response is reused
+_responses = {}  # (endpoint, ticker) -> (computed_at, payload)
+_response_locks = {}  # (endpoint, ticker) -> lock; created on first use (custom tickers are allowed)
+_locks_guard = threading.Lock()
+
+
+def cached_response(endpoint, ticker, compute):
+    """Return the cached payload if it's recent, otherwise compute and cache it.
+    The lock makes a second request for the same ticker wait for the first instead of duplicating work."""
+    key = (endpoint, ticker)
+    with _locks_guard:
+        lock = _response_locks.setdefault(key, threading.Lock())
+    with lock:
+        hit = _responses.get(key)
+        if hit and time.time() - hit[0] < RESPONSE_TTL:
+            return hit[1]
+        payload = compute(ticker)
+        _responses[key] = (time.time(), payload)
+        return payload
+
+
+_outlook = {"computed_at": 0.0, "by_ticker": {}}
+_outlook_lock = threading.Lock()
 
 
 def turbulence(ticker):
     """5-day turbulence outlook from scripts/volatility.py, recomputed at most once an hour
-    (it trains on all four tickers). Returns None if it can't be computed."""
+    (it trains on all four tickers at once). Returns None if it can't be computed."""
     try:
-        if time.time() - _outlook_cache["computed_at"] > 3600:
-            from scripts.volatility import outlook  # imported lazily: only needed for the dashboard
+        with _outlook_lock:
+            if time.time() - _outlook["computed_at"] > 3600:
+                from scripts.volatility import outlook  # imported lazily: only needed for the dashboard
 
-            _outlook_cache.update(computed_at=time.time(), by_ticker=outlook())
-        return _outlook_cache["by_ticker"].get(ticker)
+                _outlook.update(computed_at=time.time(), by_ticker=outlook())
+        return _outlook["by_ticker"].get(ticker)
     except Exception as error:
         app.logger.warning("turbulence outlook unavailable: %s", error)
         return None
 
+
+def warm_up_ticker(ticker):
+    for endpoint, compute in (("dashboard", dashboard_payload), ("replay", replay_payload)):
+        try:
+            cached_response(endpoint, ticker, compute)
+        except Exception as error:
+            app.logger.warning("warm-up failed for %s %s: %s", endpoint, ticker, error)
+
+
+def warm_up():
+    """Compute every ticker's responses in the background (in parallel), so the first clicks are fast."""
+    prices("SPY")  # shared by every ticker: download once before the parallel work starts
+    with ThreadPoolExecutor(max_workers=len(TICKERS)) as pool:
+        list(pool.map(warm_up_ticker, TICKERS))
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def records(df):
     """DataFrame -> list of dicts for JSON (NaN becomes null)."""
@@ -52,43 +101,32 @@ def requested_ticker():
 
 
 # ---------------------------------------------------------------------------
-# Endpoints
+# /api/dashboard
 # ---------------------------------------------------------------------------
 
-@app.get("/")
-def index():
-    return send_from_directory("frontend/dist", "index.html")
+def dashboard_payload(ticker):
+    news = all_news(ticker)
+    history = prices(ticker).tail(260).reset_index()  # about one year of trading days
+    history["Date"] = history.Date.dt.strftime("%Y-%m-%d")
+    latest_news = news.sort_values("date", ascending=False).head(40)
+    return {
+        "ticker": ticker,
+        "price_history": records(history[["Date", "Close", "Volume"]]),
+        "news": records(latest_news.assign(date=latest_news.date.astype(str))),
+        "turbulence": turbulence(ticker),
+        **forecast_bundle(market_frame(ticker), news),
+    }
 
 
-@app.get("/api/health")
-def health():
-    return jsonify({"ok": True, "tickers": TICKERS, "custom_tickers": True})
-
-
-@app.get("/api/dashboard")
-def dashboard():
-    ticker = requested_ticker()
-    if not ticker:
-        return jsonify({"error": "Unsupported ticker"}), 400
-    try:
-        news = all_news(ticker)
-        history = prices(ticker).tail(260).reset_index()  # about one year of trading days
-        history["Date"] = history.Date.dt.strftime("%Y-%m-%d")
-        latest_news = news.sort_values("date", ascending=False).head(40)
-        return jsonify({
-            "ticker": ticker,
-            "price_history": records(history[["Date", "Close", "Volume"]]),
-            "news": records(latest_news.assign(date=latest_news.date.astype(str))),
-            "turbulence": turbulence(ticker),
-            **forecast_bundle(market_frame(ticker), news),
-        })
-    except Exception as error:
-        return jsonify({"error": str(error)}), 502
-
-
-# --- /api/replay: validation of the direction model ---------------------------
+# ---------------------------------------------------------------------------
+# /api/replay: validation of the direction model
+# ---------------------------------------------------------------------------
 
 HORIZON = 5  # trading days; labels look 5 days ahead, so 5 rows are purged at each split boundary
+
+
+class NotEnoughHistory(Exception):
+    pass
 
 
 def split_indices(dates):
@@ -122,60 +160,95 @@ def score(predictions, actuals):
     }
 
 
+def replay_payload(ticker):
+    frame = market_frame(ticker).dropna()
+    X, y = frame[FEATURES], frame.target5
+    rows = split_indices(pd.DatetimeIndex(frame.index))
+    if len(rows["train"]) < 100 or len(rows["validation"]) < 3:
+        raise NotEnoughHistory("Insufficient history for train through 2019 and validate on 2020–2021.")
+
+    def day(i):
+        return frame.index[i].strftime("%Y-%m-%d")
+
+    # Validation: train once on pre-2020 data, forecast every 5th day of 2020–21.
+    model = ridge_model(1.0).fit(X.iloc[rows["train"]], y.iloc[rows["train"]])
+    validation = [
+        {"date": day(i), "predicted": float(model.predict(X.iloc[[i]])[0]), "always_up": 0.01, "actual": float(y.iloc[i])}
+        for i in rows["validation"]
+    ]
+
+    # Test (2022+): returned for reference but deliberately not scored, to avoid tuning on it.
+    end = rows["test_train_end"]
+    test_model = ridge_model(1.0).fit(X.iloc[:end], y.iloc[:end])
+    test = [
+        {"date": day(i), "predicted": float(test_model.predict(X.iloc[[i]])[0]), "actual": float(y.iloc[i])}
+        for i in rows["test"]
+    ]
+
+    actuals = [v["actual"] for v in validation]
+    return {
+        "ticker": ticker,
+        "split": {
+            "method": "fixed chronological dates; five-row purging",
+            "train_through": day(rows["train"][-1]),
+            "validation_start": validation[0]["date"],
+            "validation_end": validation[-1]["date"],
+            "test_start": test[0]["date"] if test else None,
+            "horizon_trading_days": HORIZON,
+            "validation_stride_trading_days": HORIZON,
+        },
+        "architecture": "StandardScaler -> Ridge(alpha=1) on six lagged market features",
+        "tuning": {"method": "fixed current model; requested validation comparison", "selected_alpha": 1.0},
+        "metrics": {
+            "current_model": score([v["predicted"] for v in validation], actuals),
+            "always_up_baseline": score([v["always_up"] for v in validation], actuals),
+        },
+        "forecasts": validation,
+        "test_forecasts": test,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/")
+def index():
+    return send_from_directory("frontend/dist", "index.html")
+
+
+@app.get("/api/health")
+def health():
+    return jsonify({"ok": True, "tickers": TICKERS, "custom_tickers": True})
+
+
+@app.get("/api/dashboard")
+def dashboard():
+    ticker = requested_ticker()
+    if not ticker:
+        return jsonify({"error": "Unsupported ticker"}), 400
+    try:
+        return jsonify(cached_response("dashboard", ticker, dashboard_payload))
+    except Exception as error:
+        return jsonify({"error": str(error)}), 502
+
+
 @app.get("/api/replay")
 def replay():
     ticker = requested_ticker()
     if not ticker:
         return jsonify({"error": "Unsupported ticker"}), 400
     try:
-        frame = market_frame(ticker).dropna()
-        X, y = frame[FEATURES], frame.target5
-        rows = split_indices(pd.DatetimeIndex(frame.index))
-        if len(rows["train"]) < 100 or len(rows["validation"]) < 3:
-            return jsonify({"error": "Insufficient history for train through 2019 and validate on 2020–2021."}), 422
-
-        def day(i):
-            return frame.index[i].strftime("%Y-%m-%d")
-
-        # Validation: train once on pre-2020 data, forecast every 5th day of 2020–21.
-        model = ridge_model(1.0).fit(X.iloc[rows["train"]], y.iloc[rows["train"]])
-        validation = [
-            {"date": day(i), "predicted": float(model.predict(X.iloc[[i]])[0]), "always_up": 0.01, "actual": float(y.iloc[i])}
-            for i in rows["validation"]
-        ]
-
-        # Test (2022+): returned for reference but deliberately not scored, to avoid tuning on it.
-        end = rows["test_train_end"]
-        test_model = ridge_model(1.0).fit(X.iloc[:end], y.iloc[:end])
-        test = [
-            {"date": day(i), "predicted": float(test_model.predict(X.iloc[[i]])[0]), "actual": float(y.iloc[i])}
-            for i in rows["test"]
-        ]
-
-        actuals = [v["actual"] for v in validation]
-        return jsonify({
-            "ticker": ticker,
-            "split": {
-                "method": "fixed chronological dates; five-row purging",
-                "train_through": day(rows["train"][-1]),
-                "validation_start": validation[0]["date"],
-                "validation_end": validation[-1]["date"],
-                "test_start": test[0]["date"] if test else None,
-                "horizon_trading_days": HORIZON,
-                "validation_stride_trading_days": HORIZON,
-            },
-            "architecture": "StandardScaler -> Ridge(alpha=1) on six lagged market features",
-            "tuning": {"method": "fixed current model; requested validation comparison", "selected_alpha": 1.0},
-            "metrics": {
-                "current_model": score([v["predicted"] for v in validation], actuals),
-                "always_up_baseline": score([v["always_up"] for v in validation], actuals),
-            },
-            "forecasts": validation,
-            "test_forecasts": test,
-        })
+        return jsonify(cached_response("replay", ticker, replay_payload))
+    except NotEnoughHistory as error:
+        return jsonify({"error": str(error)}), 422
     except Exception as error:
         return jsonify({"error": str(error)}), 502
 
+
+# Start pre-loading as soon as the module is imported (by `python app.py` or by gunicorn).
+if os.environ.get("ECHOMARKET_WARMUP", "1") != "0":
+    threading.Thread(target=warm_up, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=False)
