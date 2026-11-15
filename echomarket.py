@@ -1,5 +1,5 @@
 from __future__ import annotations
-import re, time
+import re, time, json, zipfile
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -74,7 +74,25 @@ def webhose_news(ticker):
         if not f.is_file():
             continue
         try:
-            if f.suffix.lower() == ".csv":
+            if f.suffix.lower() == ".zip":
+                # Webhose's financial-news repository distributes each weekly
+                # release as a ZIP containing JSON/JSONL article records.
+                with zipfile.ZipFile(f) as archive:
+                    records = []
+                    for member in archive.namelist():
+                        if member.endswith("/"):
+                            continue
+                        suffix = Path(member).suffix.lower()
+                        with archive.open(member) as stream:
+                            if suffix == ".csv":
+                                records.extend(pd.read_csv(stream, low_memory=False).to_dict("records"))
+                            elif suffix in (".jsonl", ".ndjson"):
+                                records.extend(json.loads(line) for line in stream.read().decode("utf-8", "ignore").splitlines() if line.strip())
+                            elif suffix == ".json":
+                                value = json.load(stream)
+                                records.extend(value if isinstance(value, list) else value.get("posts", value.get("articles", [value])))
+                    d = records
+            elif f.suffix.lower() == ".csv":
                 d = pd.read_csv(f, low_memory=False).to_dict("records")
             elif f.suffix.lower() in (".jsonl", ".ndjson"):
                 d = [
@@ -88,11 +106,19 @@ def webhose_news(ticker):
             else:
                 continue
             for x in d:
-                title = x.get("title") or x.get("headline") or ""
-                body = x.get("text") or x.get("description") or ""
-                date = x.get("published") or x.get("published_at") or x.get("date")
+                if not isinstance(x, dict):
+                    continue
+                thread = x.get("thread") if isinstance(x.get("thread"), dict) else {}
+                title = x.get("title") or x.get("headline") or x.get("name") or ""
+                body = x.get("text") or x.get("description") or x.get("snippet") or ""
+                date = x.get("published") or x.get("published_at") or x.get("date") or thread.get("published")
                 blob = (str(title) + " " + str(body)).lower()
-                if ticker.lower() not in blob:
+                symbols = x.get("symbols") or x.get("tickers") or []
+                if isinstance(symbols, str):
+                    symbols = [symbols]
+                symbol_match = any(str(s).upper() == ticker.upper() for s in symbols)
+                # Match ticker tokens, not substrings (e.g. AAPL in "Pineapple").
+                if not symbol_match and not re.search(rf"(?<![A-Z0-9]){re.escape(ticker)}(?![A-Z0-9])", blob, re.I):
                     continue
                 dt = pd.to_datetime(date, errors="coerce", utc=True)
                 if pd.isna(dt):
@@ -101,8 +127,10 @@ def webhose_news(ticker):
                     {
                         "date": dt.tz_localize(None),
                         "title": str(title),
-                        "url": x.get("url", ""),
-                        "source": x.get("site") or x.get("domain") or f.name,
+                        "url": x.get("url") or thread.get("url", ""),
+                        "source": x.get("site") or x.get("domain") or thread.get("site") or f.name,
+                        "sentiment": x.get("sentiment") or (re.search(r"_(positive|negative)_", f.name, re.I).group(1).lower() if re.search(r"_(positive|negative)_", f.name, re.I) else "unknown"),
+                        "text": str(body),
                     }
                 )
         except Exception:
@@ -110,7 +138,7 @@ def webhose_news(ticker):
     return (
         pd.DataFrame(rows).drop_duplicates("title")
         if rows
-        else pd.DataFrame(columns=["date", "title", "url", "source"])
+        else pd.DataFrame(columns=["date", "title", "url", "source", "sentiment", "text"])
     )
 
 
