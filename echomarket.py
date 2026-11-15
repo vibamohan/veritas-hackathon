@@ -33,8 +33,16 @@ def prices(ticker, period="max"):
     p = CACHE / f"{ticker}_{period}.parquet"
     if p.exists() and time.time() - p.stat().st_mtime < 3600:
         return pd.read_parquet(p)
-    df = yf.download(ticker, period=period, auto_adjust=True, progress=False)
+    try:
+        df = yf.download(ticker, period=period, auto_adjust=True, progress=False)
+    except Exception:
+        # A stale cache is still useful when the price provider is unavailable.
+        if p.exists():
+            return pd.read_parquet(p)
+        raise
     if df.empty:
+        if p.exists():
+            return pd.read_parquet(p)
         raise RuntimeError(f"No price data returned for {ticker}")
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)

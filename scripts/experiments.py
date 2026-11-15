@@ -21,7 +21,9 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.linear_model import LogisticRegression, RidgeCV
+from sklearn.ensemble import ExtraTreesRegressor, RandomForestRegressor
+from sklearn.linear_model import ElasticNetCV, LogisticRegression, RidgeCV
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -35,6 +37,7 @@ K = 15  # matched days, as on the dashboard
 BASE = ["ret1", "mom5", "mom20", "vol20", "vol_ratio", "spy5"]  # the current model's features
 EXT = BASE + ["mom60", "vol60", "ma50_gap", "ma200_gap", "spy20"]
 NEWS = ["news_count", "knn_tfidf", "knn_emb"]
+LLM_NEWS = ["llm_sentiment", "llm_confidence"]
 
 
 # ---------- data ----------
@@ -96,6 +99,21 @@ def news_features(ticker, X, Y):
     queries = [np.arange(max(a, b - 10), b) for a, b in zip(lo, hi)]
     out = {"news_count": pd.Series(np.log1p(hi - lo), index=X.index)}
 
+    # Optional headline scores produced by scripts/llm_news.py. Scores are joined
+    # by ticker and title, then aggregated only over headlines available before t.
+    llm_path = CACHE / "llm_news_scores.parquet"
+    if llm_path.exists():
+        llm = pd.read_parquet(llm_path)
+        llm = llm[llm.ticker == ticker].drop_duplicates("title").set_index("title")
+        scored = news.title.map(llm.llm_sentiment), news.title.map(llm.llm_confidence)
+        for name, values in zip(LLM_NEWS, scored):
+            values = pd.Series(values.to_numpy(), index=news.index)
+            daily = []
+            for q in queries:
+                valid = values.iloc[q].dropna()
+                daily.append(float(valid.mean()) if len(valid) else np.nan)
+            out[name] = pd.Series(daily, index=X.index)
+
     # Memory = each trading day's own headlines, with its realised outcome.
     on_trading_day = news[news.date.isin(X.index)]
     groups = on_trading_day.groupby("date").indices  # day -> row numbers in news
@@ -145,6 +163,23 @@ def linear(cols):
     return fit
 
 
+def elastic_net(cols):
+    def fit(Xtr, ytr, Xev):
+        c = [x for x in cols if x in Xtr]
+        y_scale = max(float(ytr.std()), 1e-8)
+        m = make_pipeline(
+            StandardScaler(),
+            ElasticNetCV(
+                l1_ratio=(0.1, 0.5, 0.9, 1.0),
+                alphas=np.logspace(-3, 0, 13),
+                cv=TimeSeriesSplit(n_splits=5, gap=max(HORIZONS)),
+                max_iter=20000,
+            ),
+        )
+        return m.fit(Xtr[c].fillna(0), ytr / y_scale).predict(Xev[c].fillna(0)) * y_scale
+    return fit
+
+
 def hgb(cols):
     def fit(Xtr, ytr, Xev):
         c = [x for x in cols if x in Xtr]
@@ -152,6 +187,16 @@ def hgb(cols):
             max_depth=3, learning_rate=0.05, max_iter=200, min_samples_leaf=50, l2_regularization=1.0, random_state=0
         )
         return m.fit(Xtr[c], ytr).predict(Xev[c])
+    return fit
+
+
+def forest(kind, cols):
+    def fit(Xtr, ytr, Xev):
+        c = [x for x in cols if x in Xtr]
+        estimator = (RandomForestRegressor if kind == "random_forest" else ExtraTreesRegressor)(
+            n_estimators=200, min_samples_leaf=20, max_features=0.7, n_jobs=-1, random_state=0
+        )
+        return estimator.fit(Xtr[c].fillna(0), ytr).predict(Xev[c].fillna(0))
     return fit
 
 
@@ -184,6 +229,9 @@ MODELS = {
     "Always up (train mean)": lambda Xtr, ytr, Xev: np.full(len(Xev), ytr.mean()),
     "Ridge base (current)": lambda Xtr, ytr, Xev: ridge_model(1.0).fit(Xtr[BASE], ytr).predict(Xev[BASE]),
     "Ridge ext": linear(EXT),
+    "ElasticNet ext": elastic_net(EXT),
+    "Random forest ext": forest("random_forest", EXT),
+    "Extra trees ext": forest("extra_trees", EXT),
     "Logistic ext": logit,
     "HGB ext": hgb(EXT),
     "HGB classifier ext": hgb_clf,
@@ -191,6 +239,9 @@ MODELS = {
     "News kNN embeddings": knn("knn_emb"),
     "Ridge ext + news": linear(EXT + NEWS),
     "HGB ext + news": hgb(EXT + NEWS),
+    "Ridge ext + LLM news": linear(EXT + LLM_NEWS),
+    "ElasticNet ext + LLM news": elastic_net(EXT + LLM_NEWS),
+    "HGB ext + LLM news": hgb(EXT + LLM_NEWS),
     "Ridge ext + news, gated": gated(linear(EXT + NEWS)),
     "Logistic ext, gated": gated(logit),
     "News kNN embeddings, gated": gated(knn("knn_emb")),
@@ -214,6 +265,9 @@ def run(models, horizons, test=False, target="return"):
         nf = news_features(ticker, X, Y)
         for h in horizons:
             F = X.assign(news_count=nf["news_count"], knn_tfidf=nf[("knn_tfidf", h)])
+            for name in LLM_NEWS:
+                if name in nf:
+                    F[name] = nf[name]
             if ("knn_emb", h) in nf:
                 F["knn_emb"] = nf[("knn_emb", h)]
             y = Y[h]
@@ -224,6 +278,8 @@ def run(models, horizons, test=False, target="return"):
                 for name in models:
                     if "embeddings" in name and "knn_emb" not in F:
                         continue  # sentence-transformers not installed
+                    if "+ LLM news" in name and not set(LLM_NEWS).issubset(F.columns):
+                        continue  # LLM scores have not been generated
                     pred = np.asarray(MODELS[name](F.iloc[tr], y.iloc[tr], F.iloc[ev]), dtype=float)
                     rows.append({
                         "ticker": ticker, "h": h, "year": start.year, "model": name, "n": len(ev),

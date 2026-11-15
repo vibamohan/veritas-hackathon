@@ -38,3 +38,18 @@ uv run python scripts/download_webhose_dataset.py --latest 4
 The downloader selects the newest weekly ZIP archives (positive and negative sentiment combined by default). The app reads JSON, JSONL, and CSV files inside those ZIPs as well as loose CSV/JSON/JSONL files. It extracts publication date, title, URL, and source, keeping articles that mention the ticker or company name. Keep the number of archives modest for a quick demo; the repository adds new releases over time. Review the [Webhose dataset repository](https://github.com/Webhose/financial-news-dataset) and its [terms of use](https://github.com/Webhose/free-news-datasets/blob/master/tou.MD) before use: the dataset is described as available for academic, research, and journalistic purposes.
 
 This is an educational research prototype, not investment advice. GDELT coverage and Webhose article ticker/date mapping may be incomplete; predictions are experimental.
+
+## Model experiments
+
+Run `uv run python scripts/experiments.py --target excess` to compare regression,
+classification, and point-in-time news features with walk-forward validation. The
+runner includes Ridge, ElasticNet, random forest, extra trees, gradient boosting,
+TF-IDF neighbors, and optional sentence embeddings. See
+[`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md) for the evaluation design and prior results.
+
+Optional LLM headline scoring is a separate, cached step. Set `OPENAI_API_KEY` and
+run `uv run python scripts/llm_news.py --ticker NVDA` (repeat `--ticker` as needed),
+then rerun `scripts/experiments.py`. `OPENAI_MODEL` and `OPENAI_BASE_URL` can select
+another compatible endpoint. Scoring makes external model requests; without cached
+scores the LLM feature models are skipped. Never include future outcomes in the
+headline prompt or score cache.

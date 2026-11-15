@@ -1,6 +1,6 @@
 # Model experiments: architectures, horizons, and validation periods
 
-Code: [`scripts/experiments.py`](../scripts/experiments.py). Run date: 2026-11-14.
+Code: [`scripts/experiments.py`](../scripts/experiments.py). Original comparison: 2026-11-14; additional regression comparison: 2026-11-15.
 
 ## Question
 
@@ -99,6 +99,39 @@ Selected model: **News kNN TF-IDF, 1-day, excess-over-SPY target**, the highest 
 4. **That signal is weak.** +1.6 points is about 1.1 standard errors. Across the 78 validation combinations, a t-stat around 2.5 can appear by chance. This is consistent with a small real effect but does not prove one, and it is not evidence of a tradable strategy: no transaction costs were modelled, and the test window is 21 months.
 5. **Sentence embeddings did not beat TF-IDF here.** Headlines are short and ticker-specific, so exact word overlap (company names, products, "earnings", "recall") seems to carry the useful information.
 
+## Additional regression comparison (2026-11-15)
+
+Added ElasticNet, Random Forest, and Extra Trees regressors and reran the same
+2015–2021 walk-forward folds for both targets. ElasticNet's alpha and mixing
+weight are selected with expanding time-series folds and a 20-session gap. The table gives directional edge
+over the period-specific always-up baseline (percentage points) and mean
+year/ticker Spearman IC. None of these validation scores is a fresh holdout.
+
+| Target | Model | 1 day (edge / IC) | 5 days (edge / IC) | 20 days (edge / IC) |
+| --- | --- | ---: | ---: | ---: |
+| Return | ElasticNet | −0.2 / +0.099 | −0.6 / +0.063 | −1.4 / +0.140 |
+| Return | Random Forest | −3.5 / +0.034 | −8.6 / +0.018 | −12.6 / +0.013 |
+| Return | Extra Trees | −1.6 / +0.026 | −5.3 / −0.004 | −7.1 / −0.019 |
+| Excess over SPY | ElasticNet | −0.7 / +0.007 | −0.2 / −0.062 | −0.4 / +0.023 |
+| Excess over SPY | Random Forest | −0.4 / +0.039 | −3.9 / +0.004 | −10.3 / +0.027 |
+| Excess over SPY | Extra Trees | +0.8 / +0.029 | −2.3 / −0.008 | −8.1 / −0.010 |
+
+The Extra Trees one-day excess-return hit-rate edge is +0.8 points with an
+estimated standard error of 0.7 points. This is small, not a decisive win, and
+comes from a broad model search. The stronger one-day rank correlations for
+Random Forest and Extra Trees did not translate into better hit rates. At five
+and twenty days, all added models were at or below the baseline. Price refreshes
+were unavailable during this run, so existing cached price files were used.
+ElasticNet had positive mean rank IC for raw returns, but its directional hit
+rate remained below the baseline at all three horizons. That IC did not yield
+useful sign decisions in this evaluation.
+
+LLM scoring is now an optional feature path in `scripts/llm_news.py`; it was not
+run for this comparison because no `OPENAI_API_KEY` is configured. When scores
+are generated, `scripts/experiments.py` adds point-in-time headline sentiment
+and confidence features and evaluates Ridge, ElasticNet, and HGB with those
+features. Those model rows are skipped when no cached LLM scores exist.
+
 ## Recommendations for the app
 
 - Present the forecast honestly. Show the 1-day "vs SPY" news signal with its measured hit rate (53% against a 52% baseline), or show the matched historical headlines as context only. Drop the 5-day 70/30 blend.
@@ -114,6 +147,7 @@ Selected model: **News kNN TF-IDF, 1-day, excess-over-SPY target**, the highest 
 uv run --with sentence-transformers python scripts/experiments.py                  # validation, return target
 uv run --with sentence-transformers python scripts/experiments.py --target excess  # validation, excess target
 uv run python scripts/experiments.py --test "News kNN TF-IDF" 1 --target excess    # the one test run
+uv run python scripts/llm_news.py --ticker NVDA                                   # optional LLM headline scores
 ```
 
 Without `--with sentence-transformers` the embedding models are skipped. Raw per-ticker, per-year results are written to `data/cache/experiments_validation_<target>.csv`. A full validation run takes about 4–5 minutes on a laptop.
