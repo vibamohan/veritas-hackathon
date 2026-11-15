@@ -32,22 +32,54 @@ def prices(ticker, period="5y"):
 
 def gdelt(ticker, days=90):
     p = CACHE / f"news_{ticker}_{days}.parquet"
+    columns = ["date", "title", "url", "source"]
+
+    def cached_or_empty():
+        if p.exists():
+            try:
+                return pd.read_parquet(p)
+            except (OSError, ValueError):
+                pass
+        return pd.DataFrame(columns=columns)
+
+    # Keep a stale copy available as a fallback when GDELT is temporarily
+    # rate-limiting requests. Refresh fresh data at most every 30 minutes.
     if p.exists() and time.time() - p.stat().st_mtime < 1800:
         return pd.read_parquet(p)
-    q = requests.get(
-        "https://api.gdeltproject.org/api/v2/doc/doc",
-        params={
-            "query": f'"{ticker}" sourcelang:eng',
-            "mode": "ArtList",
-            "format": "json",
-            "maxrecords": 250,
-            "timespan": f"{days}d",
-            "sort": "HybridRel",
-        },
-        timeout=25,
-    )
-    q.raise_for_status()
-    rows = q.json().get("articles", [])
+    params = {
+        "query": f'"{ticker}" sourcelang:eng',
+        "mode": "ArtList",
+        "format": "json",
+        "maxrecords": 250,
+        "timespan": f"{days}d",
+        "sort": "HybridRel",
+    }
+    q = None
+    for attempt in range(3):
+        try:
+            q = requests.get(
+                "https://api.gdeltproject.org/api/v2/doc/doc",
+                params=params,
+                timeout=25,
+            )
+            if q.status_code != 429:
+                q.raise_for_status()
+                break
+            if attempt < 2:
+                time.sleep(2 ** (attempt + 1))
+        except requests.RequestException:
+            if attempt == 2:
+                return cached_or_empty()
+            time.sleep(2 ** (attempt + 1))
+    if q is None or q.status_code == 429:
+        return cached_or_empty()
+    try:
+        payload = q.json()
+    except (requests.exceptions.JSONDecodeError, ValueError):
+        return cached_or_empty()
+    if not isinstance(payload, dict) or not isinstance(payload.get("articles", []), list):
+        return cached_or_empty()
+    rows = payload.get("articles", [])
     df = pd.DataFrame(
         [
             {
@@ -63,7 +95,11 @@ def gdelt(ticker, days=90):
     )
     if not df.empty:
         df = df.dropna(subset=["date"]).drop_duplicates("title")
-    df.to_parquet(p)
+    try:
+        df.to_parquet(p)
+    except (OSError, ValueError):
+        # A cache write failure should not take down the live dashboard.
+        pass
     return df
 
 
