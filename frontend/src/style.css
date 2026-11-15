@@ -49,6 +49,34 @@ select {
   color: white;
   font-size: 15px;
 }
+.custom-ticker {
+  display: grid;
+  gap: 8px;
+  margin-top: 18px;
+}
+.custom-ticker label {
+  margin: 0;
+  font-size: 10px;
+  color: #b9c4d3;
+}
+.custom-ticker input {
+  width: 100%;
+  min-width: 0;
+  padding: 10px;
+  background: #1c2c45;
+  border: 1px solid #30415b;
+  border-radius: 8px;
+  color: white;
+  font-size: 13px;
+}
+.custom-ticker button {
+  padding: 10px;
+  font-size: 12px;
+}
+.ticker-error {
+  color: #ffb6bd;
+  font-size: 11px;
+}
 .side-note {
   margin-top: 30px;
   color: #c8d2df;

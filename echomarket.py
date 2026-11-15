@@ -48,9 +48,14 @@ def ridge_model(alpha=1.0):
 
 
 def mentions(ticker):
-    """Regex that matches a headline about `ticker`: the ticker in capitals (not inside a longer word,
-    so "AAPL" doesn't match "AAPLX"), or the company name in any case ("nvidia", "NVIDIA")."""
-    return rf"(?<![A-Za-z0-9]){ticker}(?![A-Za-z0-9])|(?i:\b{re.escape(NAMES[ticker])}\b)"
+    """Regex for the ticker or known company name appearing in a headline."""
+    name = NAMES.get(ticker, ticker)
+    return rf"(?<![A-Za-z0-9]){re.escape(ticker)}(?![A-Za-z0-9])|(?i:\b{re.escape(name)}\b)"
+
+
+def valid_ticker(ticker):
+    """Accept common Yahoo Finance symbols, including class-share dots and hyphens."""
+    return bool(re.fullmatch(r"[A-Z0-9][A-Z0-9.-]{0,14}", ticker))
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +120,7 @@ def gdelt(ticker, days=90):
         return cached
 
     articles = _fetch_gdelt_articles({
-        "query": f'({ticker} OR "{NAMES[ticker]}") sourcelang:eng',
+        "query": f'({ticker} OR "{NAMES.get(ticker, ticker)}") sourcelang:eng',
         "mode": "ArtList",
         "format": "json",
         "maxrecords": 250,

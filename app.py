@@ -14,7 +14,7 @@ import pandas as pd
 from flask import Flask, jsonify, request, send_from_directory
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
-from echomarket import FEATURES, TICKERS, all_news, forecast_bundle, market_frame, prices, ridge_model
+from echomarket import FEATURES, TICKERS, all_news, forecast_bundle, market_frame, prices, ridge_model, valid_ticker
 
 app = Flask(__name__, static_folder="frontend/dist", static_url_path="")
 
@@ -46,9 +46,9 @@ def records(df):
 
 
 def requested_ticker():
-    """The ?ticker= query parameter, or None if it isn't one we support."""
+    """The requested Yahoo Finance symbol, or None if it has invalid characters."""
     ticker = request.args.get("ticker", "NVDA").upper()
-    return ticker if ticker in TICKERS else None
+    return ticker if valid_ticker(ticker) else None
 
 
 # ---------------------------------------------------------------------------
@@ -62,7 +62,7 @@ def index():
 
 @app.get("/api/health")
 def health():
-    return jsonify({"ok": True, "tickers": TICKERS})
+    return jsonify({"ok": True, "tickers": TICKERS, "custom_tickers": True})
 
 
 @app.get("/api/dashboard")

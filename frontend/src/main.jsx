@@ -191,6 +191,20 @@ function App() {
 // ---------------------------------------------------------------------------
 
 function Sidebar({ ticker, onChange }) {
+  const [customTicker, setCustomTicker] = useState("");
+  const [tickerError, setTickerError] = useState("");
+
+  function submitCustomTicker(event) {
+    event.preventDefault();
+    const symbol = customTicker.trim().toUpperCase();
+    if (!/^[A-Z0-9][A-Z0-9.-]{0,14}$/.test(symbol)) {
+      setTickerError("Enter a valid Yahoo Finance symbol.");
+      return;
+    }
+    setTickerError("");
+    onChange(symbol);
+  }
+
   return (
     <aside>
       <div className="brand">
@@ -202,7 +216,21 @@ function Sidebar({ ticker, onChange }) {
         {TICKERS.map((t) => (
           <option key={t}>{t}</option>
         ))}
+        {!TICKERS.includes(ticker) && <option value={ticker}>{ticker}</option>}
       </select>
+      <form className="custom-ticker" onSubmit={submitCustomTicker}>
+        <label htmlFor="customTicker">OR ENTER A SYMBOL</label>
+        <input
+          id="customTicker"
+          value={customTicker}
+          onChange={(e) => setCustomTicker(e.target.value)}
+          placeholder="e.g. MSFT or BRK-B"
+          maxLength={15}
+          autoCapitalize="characters"
+        />
+        <button type="submit">Load stock</button>
+        {tickerError && <small className="ticker-error">{tickerError}</small>}
+      </form>
       <div className="side-note">
         Live market data
         <br />

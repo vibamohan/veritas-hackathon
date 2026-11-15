@@ -1,6 +1,6 @@
 # EchoMarket
 
-Live-first historical event similarity prototype for NVDA, TSLA, AAPL, and SPY.
+Live-first historical event similarity prototype with quick picks for NVDA, TSLA, AAPL, and SPY, plus custom Yahoo Finance symbols.
 
 ## Run
 
@@ -35,6 +35,8 @@ The app downloads prices through yfinance (full history) and live headlines from
 | `frontend/src/main.jsx` | React dashboard: one component per panel, with Plotly charts |
 
 The data flow: prices and headlines are loaded and turned into features, one row per trading day. Models are trained only on days before each test period, and the dashboard shows the latest day's forecast.
+
+Enter another Yahoo Finance symbol in the dashboard to load its prices, recent headlines, and experimental five-day forecast. The volatility outlook is trained and shown only for the four preset tickers. Custom symbols depend on Yahoo Finance and GDELT recognizing the ticker; they do not have the project's preloaded historical news datasets.
 
 ## Turbulence outlook
 
