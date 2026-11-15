@@ -21,6 +21,8 @@ import "./style.css";
 
 const TICKERS = ["NVDA", "TSLA", "AAPL", "SPY"];
 const PLOT_CONFIG = { displayModeBar: false, responsive: true };
+const CHART_COLOR = "#4D5692";
+const CHART_GRID = "#E8ECE9";
 
 // Sidebar shortcuts: [element id on the page, label].
 const SECTIONS = [
@@ -72,16 +74,17 @@ function drawPriceChart(history) {
     y: history.map((row) => row.Close),
     type: "scatter",
     mode: "lines",
-    line: { color: "#3478f6", width: 2 },
+    line: { color: CHART_COLOR, width: 2.5 },
     fill: "tozeroy",
-    fillcolor: "rgba(52,120,246,.08)",
+    fillcolor: "rgba(77,86,146,.09)",
   };
   const layout = {
     margin: { l: 45, r: 15, t: 10, b: 35 },
     paper_bgcolor: "white",
     plot_bgcolor: "white",
-    xaxis: { gridcolor: "#eef1f5" },
-    yaxis: { gridcolor: "#eef1f5", tickprefix: "$" },
+    font: { family: "DM Sans, sans-serif", color: "#2C4359" },
+    xaxis: { gridcolor: CHART_GRID, linecolor: CHART_GRID },
+    yaxis: { gridcolor: CHART_GRID, linecolor: CHART_GRID, tickprefix: "$" },
   };
   Plotly.newPlot("priceChart", [line], layout, PLOT_CONFIG);
 }
@@ -93,22 +96,26 @@ function drawGauge(prediction) {
     type: "indicator",
     mode: "gauge+number",
     value: value * 100,
-    number: { suffix: "%", font: { size: 27, color: "#172b4d" } },
+    number: { suffix: "%", font: { size: 27, color: "#2C4359" } },
     gauge: {
       axis: { range: [-10, 10], ticksuffix: "%" },
-      bar: { color: value >= 0 ? "#19aa83" : "#e05b68" },
-      bgcolor: "#f4f7fb",
+      bar: { color: value >= 0 ? "#4D9C83" : "#B95760" },
+      bgcolor: "#F3F5F4",
       borderwidth: 0,
       steps: [
-        { range: [-10, 0], color: "#fff0f1" },
-        { range: [0, 10], color: "#e8faf4" },
+        { range: [-10, 0], color: "#F9EEEE" },
+        { range: [0, 10], color: "#E8F4EF" },
       ],
     },
   };
   Plotly.newPlot(
     "gauge",
     [gauge],
-    { margin: { t: 18, b: 5, l: 20, r: 20 }, paper_bgcolor: "white" },
+    {
+      margin: { t: 18, b: 5, l: 20, r: 20 },
+      paper_bgcolor: "white",
+      font: { family: "DM Sans, sans-serif", color: "#2C4359" },
+    },
     PLOT_CONFIG,
   );
 }
@@ -117,9 +124,9 @@ function drawGauge(prediction) {
 function drawReplayChart(forecasts) {
   const dates = forecasts.map((f) => f.date);
   const series = [
-    { name: "Actual", key: "actual", mode: "lines+markers", line: { color: "#21a582" } },
-    { name: "Current model", key: "predicted", mode: "lines", line: { color: "#3478f6" } },
-    { name: "Always up (+1%)", key: "always_up", mode: "lines", line: { color: "#f2a541", dash: "dot" } },
+    { name: "Actual", key: "actual", mode: "lines+markers", line: { color: "#4D9C83" } },
+    { name: "Current model", key: "predicted", mode: "lines", line: { color: CHART_COLOR } },
+    { name: "Always up (+1%)", key: "always_up", mode: "lines", line: { color: "#A87942", dash: "dot" } },
   ].map((s) => ({
     x: dates,
     y: forecasts.map((f) => f[s.key] * 100),
@@ -133,8 +140,9 @@ function drawReplayChart(forecasts) {
     legend: { orientation: "h" },
     paper_bgcolor: "white",
     plot_bgcolor: "white",
-    xaxis: { gridcolor: "#eef1f5" },
-    yaxis: { gridcolor: "#eef1f5", ticksuffix: "%" },
+    font: { family: "DM Sans, sans-serif", color: "#2C4359" },
+    xaxis: { gridcolor: CHART_GRID, linecolor: CHART_GRID },
+    yaxis: { gridcolor: CHART_GRID, linecolor: CHART_GRID, ticksuffix: "%" },
   };
   Plotly.newPlot("replayChart", series, layout, PLOT_CONFIG);
 }
@@ -268,7 +276,11 @@ function Sidebar({ ticker, onChange }) {
   return (
     <aside>
       <div className="brand">
-        ◉ Echo<span>Market</span>
+        <BrandMark />
+        <span className="brand-copy">
+          <span className="brand-name">Echo<span>Market</span></span>
+          <span className="brand-tagline">Historical event intelligence</span>
+        </span>
       </div>
       <p className="muted">VOLATILITY OUTLOOK FOR EVERYDAY INVESTORS</p>
       <label>ASSET</label>
@@ -320,6 +332,19 @@ function Head({ icon, title, sub }) {
         </span>
       </div>
     </div>
+  );
+}
+
+function BrandMark() {
+  return (
+    <svg className="brand-mark" viewBox="0 0 100 100" aria-hidden="true">
+      <g className="signal" fill="none" stroke="currentColor" strokeWidth="5" strokeLinecap="round">
+        <path d="M30 21a21 21 0 0 1 40 0" />
+        <path d="M36 29a15 15 0 0 1 28 0" />
+        <path d="M42 37a9 9 0 0 1 16 0" />
+      </g>
+      <path className="bat" d="M15 51c8 2 13 7 17 15 4-5 9-7 15-6l3 11 5-11c7-2 12 1 16 6 4-8 9-13 17-15-2 8-3 14 1 19-8-3-14-1-18 5-4-4-9-5-14-3l-7 15-7-15c-5-2-10-1-14 3-4-6-10-8-18-5 4-5 3-11 1-19Z" />
+    </svg>
   );
 }
 
