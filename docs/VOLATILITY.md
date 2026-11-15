@@ -40,6 +40,7 @@ The threshold uses only past data, so roughly half of all periods are turbulent.
 | Random forest / Extra trees | 300 trees, minimum leaf size 30 |
 | Ensemble | Average probability of logistic + HGB + random forest |
 | Pooled … | The same models trained once on all four tickers' rows: 4× the data, and features that are already relative to each stock's own normal |
+| HAR / Ridge / ElasticNet / HGB regression | Pooled regressions on the continuous log volatility ratio (see "Regression variants") |
 
 ## Method
 
@@ -66,6 +67,25 @@ Accuracy (AUC in brackets). n = 7,052 / 1,428 / 364 forecasts for *h* = 1 / 5 / 
 | Pooled HGB | 60.0% (0.64) | 66.5% (0.74) | 69.8% (0.76) |
 | Pooled random forest | 60.1% (0.65) | 66.9% (0.74) | 70.9% (0.76) |
 | Pooled ensemble | 60.5% (0.65) | 66.9% (0.75) | 71.4% (0.79) |
+
+### Regression variants (added 2026-11-15)
+
+These models predict the continuous target log(future vol / normal vol), pooled across tickers, and call a period turbulent when the prediction is above 0. HAR (Corsi 2009) is the standard volatility-forecasting regression: a linear model on daily, weekly and monthly realised volatility.
+
+| Model | 1 day | 5 days | 20 days |
+| --- | ---: | ---: | ---: |
+| Pooled logistic (selected above) | **60.7%** (0.65) | 68.0% (0.74) | 73.9% (0.79) |
+| HAR regression (rv1, rv5, rv20) | 55.4% (0.61) | 62.7% (0.69) | 63.7% (0.68) |
+| HAR + VIX + earnings | 57.4% (0.64) | 68.1% (0.74) | 70.9% (0.78) |
+| Ridge regression (all features) | 58.2% (0.65) | 67.9% (0.75) | **75.3%** (0.79) |
+| ElasticNet regression | 57.8% (0.65) | **68.6%** (0.75) | 74.7% (0.79) |
+| HGB regression | 58.5% (0.64) | 67.5% (0.75) | 72.5% (0.77) |
+
+**Reading:**
+- The textbook HAR model is no better than persistence. Adding just VIX and the earnings calendar to it gains about 5 points at 5 days, and those two features carry most of the skill.
+- The full-feature regressions tie with pooled logistic: every gap is within one standard error (±1.2 points at 5 days, ±2.4 at 20).
+- Pooled logistic stays the selected model. It is simplest, it outputs a probability for the dashboard, and switching to a model that wins by less than its noise would amount to tuning on validation.
+- The regression variants were **not** run on the test period, which keeps 2022–2023 to the single model selected in advance.
 
 ## Test results (Jan 2022 – Sep 2023, run once)
 
@@ -97,6 +117,21 @@ Standardised coefficients of the 5-day pooled logistic model, trained on all pre
 4. **Pooling all tickers into one model helped most**, more than the choice of algorithm. A simple, regularised logistic regression beat the trees. The useful information is a few strong, roughly linear signals: VIX, scheduled earnings, and recent volatility.
 5. **News features barely matter for volatility.** HGB with and without news is within noise, and the news coefficients are small. The news-similarity idea remains useful as explanation ("past weeks with headlines like this"), not as the main driver.
 
+## Live dashboard model
+
+The dashboard's "Turbulence outlook" panel uses **pooled logistic without the news features**. The historical news datasets end in 2023, and GDELT's live headline counts are on a different scale, so news features computed today would not match training. The news coefficients were small anyway. The model is the same specification evaluated once on the same split:
+
+| | Validation 2015–21 | Test 2022–23 | Persistence (test) |
+| --- | ---: | ---: | ---: |
+| Pooled logistic, no news (live) | 68.2% | **76.4%** | 66.5% |
+| Pooled logistic, with news (selected above) | 68.0% | 76.7% | 66.5% |
+
+`outlook()` in `scripts/volatility.py` trains on every day whose 5-day outcome is already known (all four tickers, 2011 onward) and scores the latest close. It also returns the main drivers: VIX vs its 1-year median, 20-day volatility vs normal, and days to the next earnings report. Upcoming earnings dates are refreshed daily from yfinance and counted in business days. `/api/dashboard` caches the result for an hour.
+
+To make the forecast usable by a beginner investor, the panel also shows:
+- **Move sizes in plain language and dollars.** These are descriptive, not model outputs: the stock's typical daily move (trailing 1-year median of 20-day root-mean-square daily return), and its average daily move in turbulent and in calm weeks over the last 3 years. An "amount invested" box turns them into dollars, for example ±$36 against ±$17 a day on $1,000 of NVDA.
+- **"What this means for you" tips,** chosen by fixed rules from the drivers: earnings within the window (expect a jump either way, and consider waiting before buying), VIX more than 20% above normal (the whole market is likely to swing), and a turbulent or calm outlook. These are educational, not financial advice.
+
 ## Caveats
 
 - One test window (21 months), and an unusual one (2022 bear market). Accuracy in calm years will likely be closer to the validation 68%.
@@ -107,7 +142,7 @@ Standardised coefficients of the 5-day pooled logistic model, trained on all pre
 ## Reproduce
 
 ```bash
-uv run python scripts/volatility.py                          # validation, 11 models × 3 horizons (~10 min)
+uv run python scripts/volatility.py                          # validation, 16 models × 3 horizons (~12 min)
 uv run python scripts/volatility.py --test "Pooled logistic" 5  # the test run (also run for 1 and 20)
 ```
 

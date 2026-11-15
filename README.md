@@ -15,6 +15,25 @@ Open http://127.0.0.1:5000. Flask serves the React production build and exposes 
 
 The app downloads prices through yfinance (full history) and live headlines from GDELT, caching files under `data/cache/`. Current prototype uses TF-IDF text similarity and a StandardScaler + Ridge regression on six lagged market features. Data loading and inference live in `echomarket.py`; `app.py` is the Flask API. The replay endpoint uses fixed chronological dates (train through 2019, validate 2020–2021, test 2022 onward), with a five-trading-day purge at split boundaries; it compares the current model with an always-up baseline on validation using MAE, RMSE, and directional accuracy. See [docs/MODEL_EVALUATION.md](docs/MODEL_EVALUATION.md) for architecture and limitations.
 
+## How the code is organized
+
+| File | What it does |
+| --- | --- |
+| `app.py` | Flask server: serves the dashboard and the `/api/dashboard`, `/api/replay` and `/api/health` endpoints |
+| `echomarket.py` | Shared settings, price loading (yfinance), news loading (GDELT, Webhose, historical datasets), and the experimental direction forecast |
+| `scripts/volatility.py` | The turbulence model: features, 17 model variants, walk-forward evaluation, and `outlook()` used by the dashboard |
+| `scripts/experiments.py` | Direction experiments (can anything beat "always up"?) and the point-in-time news-similarity features |
+| `scripts/evaluate.py` | Small news-vs-price comparison on the 2020–21 validation split |
+| `scripts/download_datasets.py` | Rebuilds `data/datasets/*.csv` from the original datasets |
+| `scripts/llm_news.py` | Optional LLM headline scoring (needs an API key) |
+| `frontend/src/main.jsx` | React dashboard: one component per panel, with Plotly charts |
+
+The data flow: prices and headlines are loaded and turned into features, one row per trading day. Models are trained only on days before each test period, and the dashboard shows the latest day's forecast.
+
+## Turbulence outlook
+
+EchoMarket helps beginner investors avoid being blindsided by volatile weeks. They often buy right before earnings, or panic-sell during a market-wide sell-off. The dashboard's headline forecast is a 5-day volatility model: will the stock move more than its usual amount over the next week, in either direction? It is a pooled logistic regression on VIX, the earnings calendar and recent volatility. It scored 76% on held-out 2022–2023 data and 68% in 2015–2021 walk-forward validation, against 67% for "same as last week". The 5-day *direction* forecast is labelled experimental because no direction model beat "always up" in testing. The panel turns the forecast into typical daily moves in dollars for an amount you enter, and gives plain-language tips (for example, earnings in 3 days). See [docs/VOLATILITY.md](docs/VOLATILITY.md) and [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md).
+
 ## Historical news datasets
 
 Ready-to-use headline files for our tickers are committed in `data/datasets/` (date, title, url, source, ticker), so a fresh clone works with no downloads. A row is kept if the dataset tags it with the ticker or its headline names the company (e.g. "Nvidia", "S&P 500").

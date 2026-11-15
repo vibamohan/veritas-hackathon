@@ -24,7 +24,12 @@ TRAIN_END, VAL_END = pd.Timestamp("2020-01-01"), pd.Timestamp("2022-01-01")
 TOP_K, NEWS_WEIGHT, H = 15, 0.3, 5  # same constants as forecast_bundle
 
 
+def join_headlines(titles):
+    return " ".join(titles.astype(str))
+
+
 def score(pred, actual):
+    """Mean absolute error, direction hit rate, and correlation of forecasts with outcomes."""
     pred, actual = np.asarray(pred), np.asarray(actual)
     hit = [np.sign(p) == np.sign(a) for p, a in zip(pred, actual) if p != 0]
     corr = np.corrcoef(pred, actual)[0, 1] if np.ptp(pred) > 0 else np.nan  # undefined for a constant
@@ -33,9 +38,9 @@ def score(pred, actual):
 
 def evaluate(ticker):
     f = market_frame(ticker).dropna()
-    pos = {d: i for i, d in enumerate(f.index)}
-    train = np.flatnonzero(f.index < TRAIN_END)[: -H]
-    val = np.flatnonzero((f.index >= TRAIN_END) & (f.index < VAL_END))[H:-H:H]
+    row_of = {day: i for i, day in enumerate(f.index)}
+    train = np.flatnonzero(f.index < TRAIN_END)[: -H]  # purge the last H rows before the boundary
+    val = np.flatnonzero((f.index >= TRAIN_END) & (f.index < VAL_END))[H:-H:H]  # every 5th day
     model = ridge_model(1.0).fit(f[FEATURES].iloc[train], f.target5.iloc[train])
     price = model.predict(f[FEATURES].iloc[val])
 
@@ -43,24 +48,24 @@ def evaluate(ticker):
     news = pd.concat([dataset_news(ticker), webhose_news(ticker)], ignore_index=True).drop_duplicates("title")
     news["date"] = pd.to_datetime(news.date)
     news["day"] = news.date.dt.normalize()
-    days = news[news.day.isin(f.index)].groupby("day").title.apply(lambda t: " ".join(t.astype(str)))
-    vec = TfidfVectorizer(max_features=3000, stop_words="english").fit(days[days.index < TRAIN_END])
-    day_mat = vec.transform(days)
-    day_pos = np.array([pos[d] for d in days.index])
+    day_docs = news[news.day.isin(f.index)].groupby("day").title.apply(join_headlines)  # one text per day
+    tfidf = TfidfVectorizer(max_features=3000, stop_words="english").fit(day_docs[day_docs.index < TRAIN_END])
+    day_vectors = tfidf.transform(day_docs)
+    day_rows = np.array([row_of[d] for d in day_docs.index])
 
     news_pred, covered = [], 0
-    for i, p in zip(val, price):
+    for i, price_forecast in zip(val, price):
         t = f.index[i]
         recent = news[(news.date < t) & (news.date >= t - pd.Timedelta(days=7))]
-        ok = day_pos + H <= i  # outcome finished by t
-        if recent.empty or not ok.any():
-            news_pred.append(p)  # no fresh news: fall back to the price model, like the dashboard
+        finished = day_rows + H <= i  # past days whose 5-day outcome was known on day t
+        if recent.empty or not finished.any():
+            news_pred.append(price_forecast)  # no fresh news: fall back to the price model, like the dashboard
             continue
         covered += 1
         query = " ".join(recent.sort_values("date").tail(10).title.astype(str))
-        sims = cosine_similarity(vec.transform([query]), day_mat[ok]).ravel()
+        sims = cosine_similarity(tfidf.transform([query]), day_vectors[finished]).ravel()
         top = np.argsort(sims)[::-1][:TOP_K]
-        outcomes = f.target5.iloc[day_pos[ok][top]].to_numpy()
+        outcomes = f.target5.iloc[day_rows[finished][top]].to_numpy()
         news_pred.append(np.average(outcomes, weights=np.maximum(sims[top], 0.001)))
 
     news_pred, actual = np.array(news_pred), f.target5.iloc[val].to_numpy()
@@ -77,4 +82,4 @@ if __name__ == "__main__":
     for ticker in [t.upper() for t in sys.argv[1:]] or TICKERS:
         rows, n, covered = evaluate(ticker)
         print(f"\n{ticker}: {n} validation forecasts, {covered} with news in the prior 7 days")
-        print(pd.DataFrame(rows).T.to_string(float_format=lambda x: f"{x:.3f}"))
+        print(pd.DataFrame(rows).T.to_string(float_format="{:.3f}".format))

@@ -1,27 +1,34 @@
-"""Model experiments: walk-forward validation over several years and horizons.
+"""Direction experiments: can any model beat "always up"? (results: docs/EXPERIMENTS.md)
 
-Validation: for each year 2015-2021, train on everything before it (last `h` rows purged so
-no label crosses the boundary) and score that year with non-overlapping forecasts
-(one every `h` trading days). 2022+ is the test set and is only scored with --test.
+How it evaluates (walk-forward validation):
+  For each year 2015–2021, train on everything before that year and forecast that year.
+  The last `h` training rows are dropped ("purged") because their labels look into the
+  scored year. Forecasts are spaced `h` days apart so scored outcomes don't overlap.
+  2022–2023 is the test set, used only with --test, once, for a model chosen in advance.
 
-News features are point-in-time: the query for day t uses headlines dated in the 7 days
-strictly before t, and matched past days must have a finished h-day outcome by t.
+News features are point-in-time: the forecast for day t only uses headlines dated in the
+7 days before t, and only matches past days whose outcome was already known on day t.
 
 Usage:
-  uv run python scripts/experiments.py                      # validation, all models
+  uv run python scripts/experiments.py                                # validation, all models
   uv run --with sentence-transformers python scripts/experiments.py   # + embedding models
-  uv run python scripts/experiments.py --target excess      # predict return minus SPY's
-  uv run python scripts/experiments.py --test "HGB ext" 20  # score one model once on 2022-2023
+  uv run python scripts/experiments.py --target excess                # predict return minus SPY's
+  uv run python scripts/experiments.py --test "HGB ext" 20            # one test run on 2022-2023
 """
 import argparse
 import sys
+from functools import partial
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
+from sklearn.ensemble import (
+    ExtraTreesRegressor,
+    HistGradientBoostingClassifier,
+    HistGradientBoostingRegressor,
+    RandomForestRegressor,
+)
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.ensemble import ExtraTreesRegressor, RandomForestRegressor
 from sklearn.linear_model import ElasticNetCV, LogisticRegression, RidgeCV
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import make_pipeline
@@ -30,41 +37,54 @@ from sklearn.preprocessing import StandardScaler
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from echomarket import CACHE, RIDGE_ALPHAS, TICKERS, dataset_news, prices, ridge_model, webhose_news
 
-HORIZONS = (1, 5, 20)
-VAL_YEARS = range(2015, 2022)
+HORIZONS = (1, 5, 20)  # forecast 1, 5 and 20 trading days ahead
+VAL_YEARS = range(2015, 2022)  # one validation fold per year
 TEST = (pd.Timestamp("2022-01-01"), pd.Timestamp("2023-10-01"))  # news datasets end ~Oct 2023
-K = 15  # matched days, as on the dashboard
-BASE = ["ret1", "mom5", "mom20", "vol20", "vol_ratio", "spy5"]  # the current model's features
-EXT = BASE + ["mom60", "vol60", "ma50_gap", "ma200_gap", "spy20"]
-NEWS = ["news_count", "knn_tfidf", "knn_emb"]
-LLM_NEWS = ["llm_sentiment", "llm_confidence"]
+K = 15  # number of similar past news days to average, as on the dashboard
+
+# Feature sets
+BASE = ["ret1", "mom5", "mom20", "vol20", "vol_ratio", "spy5"]  # the dashboard model's features
+EXT = BASE + ["mom60", "vol60", "ma50_gap", "ma200_gap", "spy20"]  # extended price features
+NEWS = ["news_count", "knn_tfidf", "knn_emb"]  # headline volume + news-similarity forecasts
+LLM_NEWS = ["llm_sentiment", "llm_confidence"]  # optional, from scripts/llm_news.py
 
 
-# ---------- data ----------
+# ===========================================================================
+# Data
+# ===========================================================================
 
 def market(ticker, target="return"):
-    d, spy = prices(ticker), prices("SPY")
-    c, v, s = d["Close"], d["Volume"], spy["Close"].reindex(d.index).ffill()
-    r = c.pct_change()
-    X = pd.DataFrame(
-        {
-            "ret1": r, "mom5": c.pct_change(5), "mom20": c.pct_change(20), "mom60": c.pct_change(60),
-            "vol20": r.rolling(20).std(), "vol60": r.rolling(60).std(), "vol_ratio": v / v.rolling(20).mean(),
-            "ma50_gap": c / c.rolling(50).mean() - 1, "ma200_gap": c / c.rolling(200).mean() - 1,
-            "spy5": s.pct_change(5), "spy20": s.pct_change(20),
-        }
-    ).replace([np.inf, -np.inf], np.nan).dropna()
-    X = X[X.index >= "2010-01-01"]  # news starts Dec 2009
-    if target == "excess":  # stock return minus SPY return: removes the market's upward drift
-        Y = pd.DataFrame({h: c.shift(-h) / c - s.shift(-h) / s for h in HORIZONS})
+    """Price features X (one row per trading day) and targets Y (one column per horizon).
+    target="return": the stock's forward return. target="excess": stock return minus SPY's."""
+    stock, spy = prices(ticker), prices("SPY")
+    close, volume = stock["Close"], stock["Volume"]
+    spy_close = spy["Close"].reindex(stock.index).ffill()
+    daily_return = close.pct_change()
+    X = pd.DataFrame({
+        "ret1": daily_return,
+        "mom5": close.pct_change(5),
+        "mom20": close.pct_change(20),
+        "mom60": close.pct_change(60),
+        "vol20": daily_return.rolling(20).std(),
+        "vol60": daily_return.rolling(60).std(),
+        "vol_ratio": volume / volume.rolling(20).mean(),
+        "ma50_gap": close / close.rolling(50).mean() - 1,  # distance from the 50-day average
+        "ma200_gap": close / close.rolling(200).mean() - 1,
+        "spy5": spy_close.pct_change(5),
+        "spy20": spy_close.pct_change(20),
+    }).replace([np.inf, -np.inf], np.nan).dropna()
+    X = X[X.index >= "2010-01-01"]  # the news datasets start in Dec 2009
+
+    if target == "excess":
+        Y = pd.DataFrame({h: close.shift(-h) / close - spy_close.shift(-h) / spy_close for h in HORIZONS})
     else:
-        Y = pd.DataFrame({h: c.shift(-h) / c - 1 for h in HORIZONS})
-    Y = Y.reindex(X.index)
-    return X, Y
+        Y = pd.DataFrame({h: close.shift(-h) / close - 1 for h in HORIZONS})
+    return X, Y.reindex(X.index)
 
 
 def embeddings(titles):
-    """title -> unit vector (all-MiniLM-L6-v2), cached; None if sentence-transformers isn't installed."""
+    """Sentence embedding (all-MiniLM-L6-v2) for each headline, cached on disk.
+    Returns None if the optional sentence-transformers package isn't installed."""
     try:
         from sentence_transformers import SentenceTransformer
     except ImportError:
@@ -74,251 +94,307 @@ def embeddings(titles):
     missing = sorted(set(titles) - set(cache.index))
     if missing:
         model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-        e = model.encode(missing, batch_size=256, normalize_embeddings=True, show_progress_bar=True)
-        new = pd.DataFrame(e.astype(np.float32), index=missing, columns=[str(i) for i in range(e.shape[1])])
-        cache = pd.concat([cache, new])
+        vectors = model.encode(missing, batch_size=256, normalize_embeddings=True, show_progress_bar=True)
+        columns = [str(i) for i in range(vectors.shape[1])]
+        cache = pd.concat([cache, pd.DataFrame(vectors.astype(np.float32), index=missing, columns=columns)])
         cache.to_parquet(path)
     return cache
 
 
-def unit(m):
-    return m / np.maximum(np.linalg.norm(m, axis=1, keepdims=True), 1e-9)
+def normalize_rows(matrix):
+    """Scale each row to length 1, so a dot product equals cosine similarity."""
+    return matrix / np.maximum(np.linalg.norm(matrix, axis=1, keepdims=True), 1e-9)
 
 
-def news_features(ticker, X, Y):
-    """Per trading day: headline count in the prior 7 days, and kNN news forecasts per horizon."""
+def load_news(ticker):
+    """Historical headlines for `ticker`, sorted by date."""
     news = pd.concat([dataset_news(ticker), webhose_news(ticker)], ignore_index=True).drop_duplicates("title")
     news["date"] = pd.to_datetime(news.date)
-    news = news.sort_values("date", kind="stable").reset_index(drop=True)
     news["title"] = news.title.astype(str)
-    nd = news.date.to_numpy()
+    return news.sort_values("date", kind="stable").reset_index(drop=True)
 
-    # Query = the 10 newest headlines in [t-7d, t).
-    lo = np.searchsorted(nd, (X.index - pd.Timedelta(days=7)).to_numpy())
-    hi = np.searchsorted(nd, X.index.to_numpy())
-    queries = [np.arange(max(a, b - 10), b) for a, b in zip(lo, hi)]
-    out = {"news_count": pd.Series(np.log1p(hi - lo), index=X.index)}
 
-    # Optional headline scores produced by scripts/llm_news.py. Scores are joined
-    # by ticker and title, then aggregated only over headlines available before t.
-    llm_path = CACHE / "llm_news_scores.parquet"
-    if llm_path.exists():
-        llm = pd.read_parquet(llm_path)
-        llm = llm[llm.ticker == ticker].drop_duplicates("title").set_index("title")
-        scored = news.title.map(llm.llm_sentiment), news.title.map(llm.llm_confidence)
-        for name, values in zip(LLM_NEWS, scored):
-            values = pd.Series(values.to_numpy(), index=news.index)
-            daily = []
-            for q in queries:
-                valid = values.iloc[q].dropna()
-                daily.append(float(valid.mean()) if len(valid) else np.nan)
-            out[name] = pd.Series(daily, index=X.index)
-
-    # Memory = each trading day's own headlines, with its realised outcome.
-    on_trading_day = news[news.date.isin(X.index)]
-    groups = on_trading_day.groupby("date").indices  # day -> row numbers in news
-    days = pd.DatetimeIndex(sorted(groups))
-    day_pos = X.index.get_indexer(days)
-
-    sims = {}
-    vec = TfidfVectorizer(max_features=3000, stop_words="english").fit(news.title[news.date < "2015-01-01"])
-    T = vec.transform(news.title)
-    D = vec.transform([" ".join(news.title.iloc[groups[d]]) for d in days])
-    Q = vec.transform([" ".join(news.title.iloc[q]) for q in queries])
-    sims["knn_tfidf"] = (Q @ D.T).toarray().astype(np.float32)
-    emb = embeddings(news.title)
-    if emb is not None:
-        E = emb.loc[news.title].to_numpy()
-        De = unit(np.stack([E[groups[d]].mean(0) for d in days]))
-        Qe = unit(np.stack([E[q].mean(0) if len(q) else np.zeros(E.shape[1]) for q in queries]))
-        sims["knn_emb"] = (Qe @ De.T).astype(np.float32)
-
-    for h in HORIZONS:
-        outcomes = Y[h].to_numpy()[day_pos]
-        # Eligible memory is a prefix of `days`: outcome finished by t and older than the query window.
-        m = np.minimum(
-            np.searchsorted(day_pos, np.arange(len(X)) - h, side="right"),
-            np.searchsorted(days.to_numpy(), (X.index - pd.Timedelta(days=7)).to_numpy()),
-        )
-        for name, S in sims.items():
-            pred = np.full(len(X), np.nan)
-            for t in range(len(X)):
-                if m[t] == 0 or len(queries[t]) == 0:
-                    continue
-                s = S[t, : m[t]]
-                top = np.argpartition(-s, min(K, m[t]) - 1)[:K]
-                pred[t] = np.average(outcomes[top], weights=np.maximum(s[top], 1e-3))
-            out[(name, h)] = pd.Series(pred, index=X.index)
+def llm_features(ticker, news, queries, index):
+    """Average LLM sentiment/confidence of each day's query headlines (only if scores were generated)."""
+    path = CACHE / "llm_news_scores.parquet"
+    if not path.exists():
+        return {}
+    scores = pd.read_parquet(path)
+    scores = scores[scores.ticker == ticker].drop_duplicates("title").set_index("title")
+    out = {}
+    for name in LLM_NEWS:
+        per_headline = pd.Series(news.title.map(scores[name]).to_numpy(), index=news.index)
+        daily = [per_headline.iloc[q].dropna().mean() for q in queries]  # NaN when nothing is scored
+        out[name] = pd.Series(daily, index=index, dtype=float)
     return out
 
 
-# ---------- models ----------
-# Each returns a score whose sign is the predicted direction (regressors: predicted return).
+def knn_forecast(similarity, outcomes, n_eligible, queries):
+    """For each day t: similarity-weighted average outcome of the K most similar eligible past days.
+    `n_eligible[t]` = how many of the (date-sorted) memory days were usable on day t."""
+    forecast = np.full(len(similarity), np.nan)
+    for t in range(len(similarity)):
+        m = n_eligible[t]
+        if m == 0 or len(queries[t]) == 0:
+            continue  # no usable history or no recent headlines
+        sims = similarity[t, :m]
+        top = np.argpartition(-sims, min(K, m) - 1)[:K]  # indices of the K largest similarities
+        forecast[t] = np.average(outcomes[top], weights=np.maximum(sims[top], 1e-3))
+    return forecast
 
-def linear(cols):
-    def fit(Xtr, ytr, Xev):
-        c = [x for x in cols if x in Xtr]  # knn_emb only exists with sentence-transformers
-        m = make_pipeline(StandardScaler(), RidgeCV(alphas=RIDGE_ALPHAS))
-        return m.fit(Xtr[c].fillna(0), ytr).predict(Xev[c].fillna(0))
-    return fit
 
+def news_features(ticker, X, Y):
+    """News features for every trading day in X:
+      news_count               log(1 + headlines in the 7 days before t)
+      (knn_tfidf, h)           kNN news forecast of the h-day outcome, TF-IDF similarity
+      (knn_emb, h)             same with sentence embeddings (if installed)
+      llm_sentiment/confidence optional LLM scores"""
+    news = load_news(ticker)
+    news_dates = news.date.to_numpy()
+    week_before = (X.index - pd.Timedelta(days=7)).to_numpy()
 
-def elastic_net(cols):
-    def fit(Xtr, ytr, Xev):
-        c = [x for x in cols if x in Xtr]
-        y_scale = max(float(ytr.std()), 1e-8)
-        m = make_pipeline(
-            StandardScaler(),
-            ElasticNetCV(
-                l1_ratio=(0.1, 0.5, 0.9, 1.0),
-                alphas=np.logspace(-3, 0, 13),
-                cv=TimeSeriesSplit(n_splits=5, gap=max(HORIZONS)),
-                max_iter=20000,
-            ),
+    # The "query" for day t = row numbers of the 10 newest headlines dated in [t - 7 days, t).
+    first = np.searchsorted(news_dates, week_before)
+    last = np.searchsorted(news_dates, X.index.to_numpy())
+    queries = [np.arange(max(a, b - 10), b) for a, b in zip(first, last)]
+    out = {"news_count": pd.Series(np.log1p(last - first), index=X.index)}
+    out.update(llm_features(ticker, news, queries, X.index))
+
+    # The "memory" = each trading day's own headlines, whose later outcome we can look up.
+    rows_by_day = news[news.date.isin(X.index)].groupby("date").indices  # day -> headline row numbers
+    memory_days = pd.DatetimeIndex(sorted(rows_by_day))
+    memory_pos = X.index.get_indexer(memory_days)  # each memory day's row number in X
+
+    # Similarity between every query and every memory day.
+    similarity = {}
+    tfidf = TfidfVectorizer(max_features=3000, stop_words="english")
+    tfidf.fit(news.title[news.date < "2015-01-01"])  # vocabulary from pre-validation headlines only
+    memory_docs = tfidf.transform([" ".join(news.title.iloc[rows_by_day[d]]) for d in memory_days])
+    query_docs = tfidf.transform([" ".join(news.title.iloc[q]) for q in queries])
+    similarity["knn_tfidf"] = (query_docs @ memory_docs.T).toarray().astype(np.float32)
+    emb = embeddings(news.title)
+    if emb is not None:
+        E = emb.loc[news.title].to_numpy()
+        memory_vecs = normalize_rows(np.stack([E[rows_by_day[d]].mean(0) for d in memory_days]))
+        query_vecs = normalize_rows(np.stack([E[q].mean(0) if len(q) else np.zeros(E.shape[1]) for q in queries]))
+        similarity["knn_emb"] = (query_vecs @ memory_vecs.T).astype(np.float32)
+
+    for h in HORIZONS:
+        outcomes = Y[h].to_numpy()[memory_pos]
+        # Memory days usable on day t: outcome finished by t (row <= t - h) AND older than the query week.
+        # Both conditions hold for a prefix of the date-sorted memory, so we only need its length.
+        n_eligible = np.minimum(
+            np.searchsorted(memory_pos, np.arange(len(X)) - h, side="right"),
+            np.searchsorted(memory_days.to_numpy(), week_before),
         )
-        return m.fit(Xtr[c].fillna(0), ytr / y_scale).predict(Xev[c].fillna(0)) * y_scale
-    return fit
+        for name, sims in similarity.items():
+            out[(name, h)] = pd.Series(knn_forecast(sims, outcomes, n_eligible, queries), index=X.index)
+    return out
 
 
-def hgb(cols):
-    def fit(Xtr, ytr, Xev):
-        c = [x for x in cols if x in Xtr]
-        m = HistGradientBoostingRegressor(
-            max_depth=3, learning_rate=0.05, max_iter=200, min_samples_leaf=50, l2_regularization=1.0, random_state=0
-        )
-        return m.fit(Xtr[c], ytr).predict(Xev[c])
-    return fit
+# ===========================================================================
+# Models
+# Every fit_* function trains on (X_train, y_train) and returns one score per row of X_eval.
+# The sign of the score is the predicted direction (for regressors it is the predicted return).
+# `cols` picks the feature columns; columns that don't exist (e.g. knn_emb without
+# sentence-transformers) are skipped.
+# ===========================================================================
+
+def available(cols, X):
+    return [c for c in cols if c in X]
 
 
-def forest(kind, cols):
-    def fit(Xtr, ytr, Xev):
-        c = [x for x in cols if x in Xtr]
-        estimator = (RandomForestRegressor if kind == "random_forest" else ExtraTreesRegressor)(
-            n_estimators=200, min_samples_leaf=20, max_features=0.7, n_jobs=-1, random_state=0
-        )
-        return estimator.fit(Xtr[c].fillna(0), ytr).predict(Xev[c].fillna(0))
-    return fit
+def fit_always_up(X_train, y_train, X_eval):
+    """Baseline: predict the training-period average return (almost always positive = 'up')."""
+    return np.full(len(X_eval), y_train.mean())
 
 
-def logit(Xtr, ytr, Xev):
-    m = make_pipeline(StandardScaler(), LogisticRegression(C=0.1, max_iter=1000)).fit(Xtr[EXT], ytr > 0)
-    return m.predict_proba(Xev[EXT])[:, 1] - 0.5
+def fit_dashboard_ridge(X_train, y_train, X_eval):
+    """The dashboard's model: Ridge(alpha=1) on the 6 BASE features."""
+    return ridge_model(1.0).fit(X_train[BASE], y_train).predict(X_eval[BASE])
 
 
-def hgb_clf(Xtr, ytr, Xev):
-    m = HistGradientBoostingClassifier(
-        max_depth=3, learning_rate=0.05, max_iter=200, min_samples_leaf=50, l2_regularization=1.0, random_state=0
-    ).fit(Xtr[EXT], ytr > 0)
-    return m.predict_proba(Xev[EXT])[:, 1] - 0.5
+def fit_ridge(X_train, y_train, X_eval, cols):
+    """Ridge regression; alpha chosen by cross-validation. Missing news values are filled with 0."""
+    c = available(cols, X_train)
+    model = make_pipeline(StandardScaler(), RidgeCV(alphas=RIDGE_ALPHAS))
+    return model.fit(X_train[c].fillna(0), y_train).predict(X_eval[c].fillna(0))
 
 
-def knn(col):
-    # Standalone news forecast; fall back to the training mean when there is no recent news.
-    return lambda Xtr, ytr, Xev: Xev[col].fillna(ytr.mean()).to_numpy()
+def fit_elastic_net(X_train, y_train, X_eval, cols):
+    """ElasticNet (mix of Lasso and Ridge); strength chosen by time-ordered cross-validation.
+    The target is rescaled to unit variance so the alpha grid fits any horizon."""
+    c = available(cols, X_train)
+    scale = max(float(y_train.std()), 1e-8)
+    model = make_pipeline(
+        StandardScaler(),
+        ElasticNetCV(l1_ratio=(0.1, 0.5, 0.9, 1.0), alphas=np.logspace(-3, 0, 13),
+                     cv=TimeSeriesSplit(n_splits=5, gap=max(HORIZONS)), max_iter=20000),
+    )
+    return model.fit(X_train[c].fillna(0), y_train / scale).predict(X_eval[c].fillna(0)) * scale
 
 
-def gated(fn, q=0.2):
-    """Say 'down' only when the model is in its most bearish q of training-period predictions."""
-    def fit(Xtr, ytr, Xev):
-        p = np.asarray(fn(Xtr, ytr, pd.concat([Xtr, Xev])))
-        return p[len(Xtr):] - np.quantile(p[: len(Xtr)], q)
-    return fit
+def fit_boosted_trees(X_train, y_train, X_eval, cols):
+    """Gradient-boosted trees (HGB), kept shallow and regularised. Handles missing values natively."""
+    c = available(cols, X_train)
+    model = HistGradientBoostingRegressor(max_depth=3, learning_rate=0.05, max_iter=200,
+                                          min_samples_leaf=50, l2_regularization=1.0, random_state=0)
+    return model.fit(X_train[c], y_train).predict(X_eval[c])
 
 
+def fit_forest(X_train, y_train, X_eval, cols, extra_trees=False):
+    """Random forest, or extra trees (more randomised splits)."""
+    c = available(cols, X_train)
+    Forest = ExtraTreesRegressor if extra_trees else RandomForestRegressor
+    model = Forest(n_estimators=200, min_samples_leaf=20, max_features=0.7, n_jobs=-1, random_state=0)
+    return model.fit(X_train[c].fillna(0), y_train).predict(X_eval[c].fillna(0))
+
+
+def fit_logistic(X_train, y_train, X_eval):
+    """Logistic regression on direction (up/down). Score = P(up) - 0.5."""
+    model = make_pipeline(StandardScaler(), LogisticRegression(C=0.1, max_iter=1000))
+    return model.fit(X_train[EXT], y_train > 0).predict_proba(X_eval[EXT])[:, 1] - 0.5
+
+
+def fit_boosted_classifier(X_train, y_train, X_eval):
+    """Gradient-boosted trees classifying direction. Score = P(up) - 0.5."""
+    model = HistGradientBoostingClassifier(max_depth=3, learning_rate=0.05, max_iter=200,
+                                           min_samples_leaf=50, l2_regularization=1.0, random_state=0)
+    return model.fit(X_train[EXT], y_train > 0).predict_proba(X_eval[EXT])[:, 1] - 0.5
+
+
+def fit_news_knn(X_train, y_train, X_eval, col):
+    """Use a precomputed kNN news forecast directly; without recent news, predict the training mean."""
+    return X_eval[col].fillna(y_train.mean()).to_numpy()
+
+
+def fit_gated(X_train, y_train, X_eval, model, quantile=0.2):
+    """Wraps another model: says 'down' only when its score is in the most bearish 20% of the
+    scores it gives on the training period, and 'up' otherwise."""
+    scores = np.asarray(model(X_train, y_train, pd.concat([X_train, X_eval])))
+    train_scores, eval_scores = scores[: len(X_train)], scores[len(X_train):]
+    return eval_scores - np.quantile(train_scores, quantile)
+
+
+# name -> function(X_train, y_train, X_eval). partial() fills in each model's settings.
 MODELS = {
-    "Always up (train mean)": lambda Xtr, ytr, Xev: np.full(len(Xev), ytr.mean()),
-    "Ridge base (current)": lambda Xtr, ytr, Xev: ridge_model(1.0).fit(Xtr[BASE], ytr).predict(Xev[BASE]),
-    "Ridge ext": linear(EXT),
-    "ElasticNet ext": elastic_net(EXT),
-    "Random forest ext": forest("random_forest", EXT),
-    "Extra trees ext": forest("extra_trees", EXT),
-    "Logistic ext": logit,
-    "HGB ext": hgb(EXT),
-    "HGB classifier ext": hgb_clf,
-    "News kNN TF-IDF": knn("knn_tfidf"),
-    "News kNN embeddings": knn("knn_emb"),
-    "Ridge ext + news": linear(EXT + NEWS),
-    "HGB ext + news": hgb(EXT + NEWS),
-    "Ridge ext + LLM news": linear(EXT + LLM_NEWS),
-    "ElasticNet ext + LLM news": elastic_net(EXT + LLM_NEWS),
-    "HGB ext + LLM news": hgb(EXT + LLM_NEWS),
-    "Ridge ext + news, gated": gated(linear(EXT + NEWS)),
-    "Logistic ext, gated": gated(logit),
-    "News kNN embeddings, gated": gated(knn("knn_emb")),
+    "Always up (train mean)": fit_always_up,
+    "Ridge base (current)": fit_dashboard_ridge,
+    "Ridge ext": partial(fit_ridge, cols=EXT),
+    "ElasticNet ext": partial(fit_elastic_net, cols=EXT),
+    "Random forest ext": partial(fit_forest, cols=EXT),
+    "Extra trees ext": partial(fit_forest, cols=EXT, extra_trees=True),
+    "Logistic ext": fit_logistic,
+    "HGB ext": partial(fit_boosted_trees, cols=EXT),
+    "HGB classifier ext": fit_boosted_classifier,
+    "News kNN TF-IDF": partial(fit_news_knn, col="knn_tfidf"),
+    "News kNN embeddings": partial(fit_news_knn, col="knn_emb"),
+    "Ridge ext + news": partial(fit_ridge, cols=EXT + NEWS),
+    "HGB ext + news": partial(fit_boosted_trees, cols=EXT + NEWS),
+    "Ridge ext + LLM news": partial(fit_ridge, cols=EXT + LLM_NEWS),
+    "ElasticNet ext + LLM news": partial(fit_elastic_net, cols=EXT + LLM_NEWS),
+    "HGB ext + LLM news": partial(fit_boosted_trees, cols=EXT + LLM_NEWS),
+    "Ridge ext + news, gated": partial(fit_gated, model=partial(fit_ridge, cols=EXT + NEWS)),
+    "Logistic ext, gated": partial(fit_gated, model=fit_logistic),
+    "News kNN embeddings, gated": partial(fit_gated, model=partial(fit_news_knn, col="knn_emb")),
 }
 
 
-# ---------- evaluation ----------
+# ===========================================================================
+# Evaluation
+# ===========================================================================
 
-def folds(index, h, test):
+def periods(test):
+    """(start, end) of each scored period: one per validation year, or the single test period."""
     if test:
-        yield TEST
-    else:
-        for y in VAL_YEARS:
-            yield pd.Timestamp(f"{y}-01-01"), pd.Timestamp(f"{y + 1}-01-01")
+        return [TEST]
+    return [(pd.Timestamp(f"{y}-01-01"), pd.Timestamp(f"{y + 1}-01-01")) for y in VAL_YEARS]
+
+
+def can_run(name, features):
+    """Skip models whose optional inputs weren't generated."""
+    if "embeddings" in name and "knn_emb" not in features:
+        return False  # sentence-transformers not installed
+    if "+ LLM news" in name and not set(LLM_NEWS).issubset(features.columns):
+        return False  # scripts/llm_news.py hasn't been run
+    return True
 
 
 def run(models, horizons, test=False, target="return"):
+    """Train and score every model on every ticker, horizon and period. One result row per combination."""
     rows = []
-    for ticker in [t for t in TICKERS if not (target == "excess" and t == "SPY")]:
+    tickers = [t for t in TICKERS if not (target == "excess" and t == "SPY")]  # SPY minus SPY is 0
+    for ticker in tickers:
         X, Y = market(ticker, target)
         nf = news_features(ticker, X, Y)
         for h in horizons:
-            F = X.assign(news_count=nf["news_count"], knn_tfidf=nf[("knn_tfidf", h)])
+            # Feature table for this horizon (the kNN forecasts depend on h).
+            features = X.assign(news_count=nf["news_count"], knn_tfidf=nf[("knn_tfidf", h)])
             for name in LLM_NEWS:
                 if name in nf:
-                    F[name] = nf[name]
+                    features[name] = nf[name]
             if ("knn_emb", h) in nf:
-                F["knn_emb"] = nf[("knn_emb", h)]
+                features["knn_emb"] = nf[("knn_emb", h)]
             y = Y[h]
-            for start, end in folds(X.index, h, test):
-                tr = np.flatnonzero((X.index < start) & y.notna().to_numpy())[:-h]  # purge h rows
-                ev = np.flatnonzero((X.index >= start) & (X.index < end) & y.notna().to_numpy())[::h]
-                actual = y.iloc[ev].to_numpy()
+            has_label = y.notna().to_numpy()
+
+            for start, end in periods(test):
+                train = np.flatnonzero((X.index < start) & has_label)[:-h]  # purge the last h rows
+                scored = np.flatnonzero((X.index >= start) & (X.index < end) & has_label)[::h]  # every h-th day
+                actual = y.iloc[scored].to_numpy()
                 for name in models:
-                    if "embeddings" in name and "knn_emb" not in F:
-                        continue  # sentence-transformers not installed
-                    if "+ LLM news" in name and not set(LLM_NEWS).issubset(F.columns):
-                        continue  # LLM scores have not been generated
-                    pred = np.asarray(MODELS[name](F.iloc[tr], y.iloc[tr], F.iloc[ev]), dtype=float)
+                    if not can_run(name, features):
+                        continue
+                    fit = MODELS[name]
+                    pred = np.asarray(fit(features.iloc[train], y.iloc[train], features.iloc[scored]), dtype=float)
+                    constant = np.ptp(pred) == 0  # a constant forecast has no rank correlation
                     rows.append({
-                        "ticker": ticker, "h": h, "year": start.year, "model": name, "n": len(ev),
-                        "hits": int(((pred > 0) == (actual > 0)).sum()), "ups": int((actual > 0).sum()),
-                        "ic": pd.Series(pred).corr(pd.Series(actual), method="spearman") if np.ptp(pred) > 0 else np.nan,
+                        "ticker": ticker, "h": h, "year": start.year, "model": name, "n": len(scored),
+                        "hits": int(((pred > 0) == (actual > 0)).sum()),  # correct direction calls
+                        "ups": int((actual > 0).sum()),  # what "always up" would get right
+                        "ic": np.nan if constant else pd.Series(pred).corr(pd.Series(actual), method="spearman"),
                     })
     return pd.DataFrame(rows)
 
 
-def summarize(r):
-    g = r.groupby(["h", "model"], sort=False)
+def summarize(results):
+    """One line per (horizon, model): hit rate vs always-up, and rank correlation (IC)."""
+    # A constant forecast (e.g. ElasticNet shrunk to the mean) has no rank information, so count its
+    # IC as 0. Averaging only the non-constant periods would inflate mean_IC.
+    constant = results.ic.isna() & (results.model != "Always up (train mean)")
+    results = results.assign(constant=constant, ic=results.ic.mask(constant, 0.0),
+                             beat_up=results.hits > results.ups)
+    g = results.groupby(["h", "model"], sort=False)
     s = pd.DataFrame({
         "n": g.n.sum(),
         "direction": g.hits.sum() / g.n.sum(),
         "always_up": g.ups.sum() / g.n.sum(),
         "mean_IC": g.ic.mean(),
-        "IC_t": g.ic.mean() / (g.ic.std() / np.sqrt(g.ic.count())),
-        "years_beating_up": r.assign(win=r.hits > r.ups).groupby(["h", "model"], sort=False).win.mean(),
+        "constant_folds": g.constant.mean(),
+        "IC_t": g.ic.mean() / (g.ic.std() / np.sqrt(g.ic.count())),  # mean IC / its standard error
+        "years_beating_up": g.beat_up.mean(),
     })
     s["edge_pts"] = (s.direction - s.always_up) * 100
-    s["se_pts"] = np.sqrt(s.always_up * (1 - s.always_up) / s.n) * 100  # ~1 std error of a hit rate
-    return s[["n", "direction", "always_up", "edge_pts", "se_pts", "mean_IC", "IC_t", "years_beating_up"]]
+    s["se_pts"] = np.sqrt(s.always_up * (1 - s.always_up) / s.n) * 100  # ~1 standard error of a hit rate
+    return s[["n", "direction", "always_up", "edge_pts", "se_pts", "mean_IC", "IC_t", "constant_folds",
+              "years_beating_up"]]
 
+
+FORMATS = {"direction": "{:.3f}", "always_up": "{:.3f}", "edge_pts": "{:+.1f}", "se_pts": "{:.1f}",
+           "mean_IC": "{:+.3f}", "IC_t": "{:+.1f}", "constant_folds": "{:.0%}", "years_beating_up": "{:.0%}"}
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--target", choices=("return", "excess"), default="return",
-                    help="excess = beat SPY (NVDA/TSLA/AAPL only)")
-    ap.add_argument("--test", nargs=2, metavar=("MODEL", "HORIZON"), help="score one model once on 2022-2023")
-    a = ap.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--target", choices=("return", "excess"), default="return",
+                        help="excess = beat SPY (NVDA/TSLA/AAPL only)")
+    parser.add_argument("--test", nargs=2, metavar=("MODEL", "HORIZON"), help="score one model once on 2022-2023")
+    args = parser.parse_args()
     pd.set_option("display.width", 200)
-    fmt = {"direction": "{:.3f}", "always_up": "{:.3f}", "edge_pts": "{:+.1f}", "se_pts": "{:.1f}",
-           "mean_IC": "{:+.3f}", "IC_t": "{:+.1f}", "years_beating_up": "{:.0%}"}
-    if a.test:
-        model, h = a.test[0], int(a.test[1])
-        r = run(["Always up (train mean)", "Ridge base (current)", model], [h], test=True, target=a.target)
-        print(r.to_string())
+    if args.test:
+        model, h = args.test[0], int(args.test[1])
+        results = run(["Always up (train mean)", "Ridge base (current)", model], [h], test=True, target=args.target)
+        print(results.to_string())
     else:
-        r = run(list(MODELS), HORIZONS, target=a.target)
-        r.to_csv(CACHE / f"experiments_validation_{a.target}.csv", index=False)
-    s = summarize(r)
-    print(s.to_string(formatters={k: v.format for k, v in fmt.items()}))
+        results = run(list(MODELS), HORIZONS, target=args.target)
+        results.to_csv(CACHE / f"experiments_validation_{args.target}.csv", index=False)
+    print(summarize(results).to_string(formatters={k: v.format for k, v in FORMATS.items()}))

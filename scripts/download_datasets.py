@@ -24,22 +24,29 @@ KAGGLE_PAGE = "https://www.kaggle.com/datasets/miguelaenlle/massive-stock-news-a
 
 
 def get(url):
+    """Download a file into memory."""
     print("downloading", url)
-    r = requests.get(url, timeout=600)
-    r.raise_for_status()
-    return io.BytesIO(r.content)
+    response = requests.get(url, timeout=600)
+    response.raise_for_status()
+    return io.BytesIO(response.content)
 
 
 def save(df, name):
-    # A row belongs to a ticker if the dataset tags it with that ticker or its headline names it.
-    df = pd.concat(
-        df[(df.ticker == t) | df.title.str.contains(mentions(t), na=False)].assign(ticker=t) for t in TICKERS
-    )
+    """Keep only rows about our tickers and write data/datasets/<name>.csv.
+    A row belongs to a ticker if the dataset tags it with that ticker OR its headline names it
+    (so a headline can be kept for several tickers)."""
+    per_ticker = []
+    for t in TICKERS:
+        about_t = (df.ticker == t) | df.title.str.contains(mentions(t), na=False)
+        per_ticker.append(df[about_t].assign(ticker=t))
+    df = pd.concat(per_ticker)
     df["date"] = df.date.astype(str).str[:10]  # keep the calendar day, drop time/timezone
     df = df.drop_duplicates(["ticker", "title"])
     df.to_csv(DEST / f"{name}.csv", index=False)
     print(f"saved {len(df)} rows to {DEST / name}.csv:", df.ticker.value_counts().to_dict())
 
+
+# Each loader renames the source's columns to: date, ticker, title, url, source.
 
 def huggingface():
     cols = {"date": "date", "stock": "ticker", "title": "title"}

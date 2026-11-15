@@ -109,10 +109,10 @@ year/ticker Spearman IC. None of these validation scores is a fresh holdout.
 
 | Target | Model | 1 day (edge / IC) | 5 days (edge / IC) | 20 days (edge / IC) |
 | --- | --- | ---: | ---: | ---: |
-| Return | ElasticNet | −0.2 / +0.099 | −0.6 / +0.063 | −1.4 / +0.140 |
+| Return | ElasticNet | −0.2 / +0.021 | −0.6 / +0.027 | −1.4 / +0.060 |
 | Return | Random Forest | −3.5 / +0.034 | −8.6 / +0.018 | −12.6 / +0.013 |
 | Return | Extra Trees | −1.6 / +0.026 | −5.3 / −0.004 | −7.1 / −0.019 |
-| Excess over SPY | ElasticNet | −0.7 / +0.007 | −0.2 / −0.062 | −0.4 / +0.023 |
+| Excess over SPY | ElasticNet | −0.6 / +0.003 | −0.2 / −0.027 | −0.4 / +0.010 |
 | Excess over SPY | Random Forest | −0.4 / +0.039 | −3.9 / +0.004 | −10.3 / +0.027 |
 | Excess over SPY | Extra Trees | +0.8 / +0.029 | −2.3 / −0.008 | −8.1 / −0.010 |
 
@@ -122,9 +122,7 @@ comes from a broad model search. The stronger one-day rank correlations for
 Random Forest and Extra Trees did not translate into better hit rates. At five
 and twenty days, all added models were at or below the baseline. Price refreshes
 were unavailable during this run, so existing cached price files were used.
-ElasticNet had positive mean rank IC for raw returns, but its directional hit
-rate remained below the baseline at all three horizons. That IC did not yield
-useful sign decisions in this evaluation.
+**ElasticNet mostly shrinks to a constant.** It predicts the training mean, which is "always up", in 79% of one-day folds and 52–57% of the others. That is why its edge is close to 0. An earlier version of this table averaged IC over only the non-constant folds, which inflated it (+0.099 / +0.140). The corrected IC above counts constant folds as 0. `summarize()` now does this and reports `constant_folds`. ElasticNet's IC is no better than Ridge's.
 
 LLM scoring is now an optional feature path in `scripts/llm_news.py`; it was not
 run for this comparison because no `OPENAI_API_KEY` is configured. When scores
