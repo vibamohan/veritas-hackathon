@@ -1,0 +1,8 @@
+.venv/
+node_modules/
+frontend/dist/
+uv.lock
+__pycache__/
+.streamlit/secrets.toml
+data/cache/
+data/kaggle/
