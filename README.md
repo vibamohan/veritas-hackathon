@@ -13,7 +13,7 @@ uv run python app.py
 
 Open http://127.0.0.1:5000. Flask serves the React production build and exposes `/api/dashboard`, `/api/replay`, and `/api/health`. For frontend development, run `npm --prefix frontend run dev` in another terminal; Vite proxies API calls to Flask.
 
-The app downloads prices through yfinance (full history) and live headlines from GDELT, caching files under `data/cache/`. Current prototype uses TF-IDF text similarity and Ridge regression with chronological replay. Data loading and the model live in `echomarket.py`; `app.py` is the Flask API.
+The app downloads prices through yfinance (full history) and live headlines from GDELT, caching files under `data/cache/`. Current prototype uses TF-IDF text similarity and a StandardScaler + Ridge regression on six lagged market features. Data loading and inference live in `echomarket.py`; `app.py` is the Flask API. The replay endpoint uses fixed chronological dates (train through 2019, validate 2020–2021, test 2022 onward), with a five-trading-day purge at split boundaries; it compares the current model with an always-up baseline on validation using MAE, RMSE, and directional accuracy. See [docs/MODEL_EVALUATION.md](docs/MODEL_EVALUATION.md) for architecture and limitations.
 
 ## Historical news datasets
 

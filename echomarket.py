@@ -6,6 +6,8 @@ import requests
 import yfinance as yf
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import Ridge
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 from sklearn.metrics.pairwise import cosine_similarity
 
 CACHE = Path("data/cache")
@@ -14,6 +16,12 @@ TICKERS = ["NVDA", "TSLA", "AAPL", "SPY"]
 NAMES = {"NVDA": "Nvidia", "TSLA": "Tesla", "AAPL": "Apple", "SPY": "S&P 500"}
 NEWS_COLS = ["date", "title", "url", "source"]
 FEATURES = ["ret1", "mom5", "mom20", "vol20", "vol_ratio", "spy5"]
+RIDGE_ALPHAS = (0.01, 0.1, 1.0, 10.0, 100.0)
+
+
+def ridge_model(alpha=1.0):
+    """Scale heterogeneous market features before regularized linear regression."""
+    return make_pipeline(StandardScaler(), Ridge(alpha=alpha))
 
 
 def mentions(ticker):
@@ -166,7 +174,7 @@ def market_frame(ticker):
 
 def forecast_bundle(frame, news):
     known = frame.dropna(subset=["target5"])  # days whose 5-day outcome is known
-    model = Ridge(alpha=1).fit(known[FEATURES], known.target5)
+    model = ridge_model().fit(known[FEATURES], known.target5)
     base = float(model.predict(frame[FEATURES].iloc[[-1]])[0])  # predict from today
 
     # Today's story = the 10 newest headlines; compare it to each past day's headlines.
