@@ -1,9 +1,9 @@
-"""Score dated headlines with an optional OpenAI-compatible chat model.
+"""score dated headlines with an optional OpenAI-compatible chat model.
 
-Set OPENAI_API_KEY (and optionally OPENAI_MODEL / OPENAI_BASE_URL), then run:
+set OPENAI_API_KEY (and optionally OPENAI_MODEL / OPENAI_BASE_URL), then run:
   uv run python scripts/llm_news.py --ticker NVDA
 
-Scores are cached by ticker and title in data/cache/llm_news_scores.parquet. The
+scores are cached by ticker and title in data/cache/llm_news_scores.parquet. the
 walk-forward experiment runner only consumes scores dated before each forecast.
 """
 import argparse
@@ -24,7 +24,10 @@ OUTPUT = CACHE / "llm_news_scores.parquet"
 
 
 def score_batch(ticker, titles, api_key, model, base_url):
+    """send up to 20 headlines to the llm and get back a sentiment (-1 to +1) and a confidence (0 to 1) for each."""
+    # number the headlines so the llm can answer in the same order.
     indexed = "\n".join(f'{i}: {json.dumps(title)}' for i, title in enumerate(titles))
+    # ask an openai-compatible chat model to rate each headline, as JSON.
     response = requests.post(
         f"{base_url.rstrip('/')}/chat/completions",
         headers={"Authorization": f"Bearer {api_key}"},
@@ -48,10 +51,12 @@ def score_batch(ticker, titles, api_key, model, base_url):
         timeout=90,
     )
     response.raise_for_status()
+    # read the ratings and make sure we got exactly one per headline.
     content = response.json()["choices"][0]["message"]["content"]
     values = json.loads(content)["scores"]
     if len(values) != len(titles):
         raise ValueError("LLM returned a different number of scores than input headlines")
+    # clip the numbers into range: sentiment -1 to +1, confidence 0 to 1.
     return [
         {
             "ticker": ticker,
@@ -64,21 +69,25 @@ def score_batch(ticker, titles, api_key, model, base_url):
 
 
 def main():
+    """score every headline that isn't cached yet, saving after each batch so a crash loses nothing."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ticker", choices=TICKERS, action="append", help="Repeat to score multiple tickers; default: all")
     parser.add_argument("--limit", type=int, help="Optional maximum uncached titles per ticker")
     args = parser.parse_args()
+    # the api key, model and server come from environment variables, never from the code.
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         parser.error("OPENAI_API_KEY is required; no headlines were sent")
     model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
     base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    # headlines that were already scored are skipped.
     cache = pd.read_parquet(OUTPUT) if OUTPUT.exists() else pd.DataFrame(
         columns=["ticker", "title", "llm_sentiment", "llm_confidence"]
     )
     done = set(zip(cache.ticker.astype(str), cache.title.astype(str)))
     additions = []
 
+    # for each stock: find unscored headlines and send them in batches of 20.
     for ticker in args.ticker or TICKERS:
         news = pd.concat([dataset_news(ticker), webhose_news(ticker)], ignore_index=True)
         titles = list(dict.fromkeys(news.title.dropna().astype(str)))
@@ -89,7 +98,7 @@ def main():
         for start in range(0, len(missing), BATCH_SIZE):
             batch = missing[start : start + BATCH_SIZE]
             additions.extend(score_batch(ticker, batch, api_key, model, base_url))
-            # Persist each batch so an interrupted run can continue from cache.
+            # persist each batch so an interrupted run can continue from cache.
             cache = pd.concat([cache, pd.DataFrame(additions)], ignore_index=True).drop_duplicates(
                 ["ticker", "title"], keep="last"
             )

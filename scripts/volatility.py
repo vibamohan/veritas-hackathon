@@ -1,17 +1,17 @@
-"""Volatility model: will the next h trading days be more turbulent than usual? (results: docs/VOLATILITY.md)
+"""volatility model: will the next h trading days be more turbulent than usual? (results: docs/VOLATILITY.md)
 
-Target ("turbulent"): the stock's realised volatility over the next h days, sqrt(mean(daily return^2)),
-is above its own trailing 1-year median. Direction doesn't matter, only the size of the moves.
-Baselines: "majority class" (always guess the more common label) and "persistence"
+target ("turbulent"): the stock's realised volatility over the next h days, sqrt(mean(daily return^2)),
+is above its own trailing 1-year median. direction doesn't matter, only the size of the moves.
+baselines: "majority class" (always guess the more common label) and "persistence"
 (guess that the next h days will be like the last h days).
 
-Validation (2015–2021, one fold per year) and the single test run (2022-01 to 2023-09) work as in
-experiments.py. Every feature is known at the close of day t: earnings dates are announced weeks in
+validation (2015–2021, one fold per year) and the single test run (2022-01 to 2023-09) work as in
+experiments.py. every feature is known at the close of day t: earnings dates are announced weeks in
 advance, and news comes from the 7 days before t.
 
-The dashboard calls outlook() at the bottom of this file.
+the dashboard calls outlook() at the bottom of this file.
 
-Usage:
+usage:
   uv run python scripts/volatility.py                                 # validation, all models (~12 min)
   uv run python scripts/volatility.py --test "Pooled logistic" 5      # one test run on 2022-2023
 """
@@ -42,32 +42,34 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))  # for experiments (als
 from echomarket import CACHE, TICKERS, prices
 from experiments import TEST, VAL_YEARS, news_features
 
+# forecast 1, 5 and 20 trading days ahead (the dashboard uses 5).
 HORIZONS = (1, 5, 20)
 TRADING_DAYS_PER_YEAR = 252
 
 
 # ===========================================================================
-# Data
+# data
 # ===========================================================================
 
 class TickerData(NamedTuple):
     X: pd.DataFrame  # features, one row per trading day
-    turbulent: pd.DataFrame  # target per horizon: True / False (NaN when the future isn't known yet)
+    turbulent: pd.DataFrame  # target per horizon: true / false (NaN when the future isn't known yet)
     persistence: pd.DataFrame  # baseline guess per horizon: were the last h days turbulent?
     log_vol_ratio: pd.DataFrame  # continuous target per horizon: log(future vol / normal vol)
 
 
 def realised_vol(returns, window):
-    """Root-mean-square daily return over a trailing window (a standard volatility measure)."""
+    """root-mean-square daily return over a trailing window (a standard volatility measure)."""
     return np.sqrt((returns ** 2).rolling(window).mean())
 
 
 def earnings_reaction_positions(ticker, index):
-    """Row numbers (in `index`) of the trading day each earnings report first moves the stock.
-    Upcoming reports after the last row get row numbers past the end, counted in business days.
+    """row numbers (in `index`) of the trading day each earnings report first moves the stock.
+    upcoming reports after the last row get row numbers past the end, counted in business days.
     SPY is an index fund and has no earnings."""
     if ticker == "SPY":
         return np.array([], dtype=int)
+    # earnings dates come from yahoo; saved for a day so new upcoming dates still show up.
     path = CACHE / f"earnings_{ticker}.parquet"
     if path.exists() and time.time() - path.stat().st_mtime < 86400:  # refresh daily for new dates
         stamps = pd.read_parquet(path).date
@@ -77,10 +79,11 @@ def earnings_reaction_positions(ticker, index):
         stamps.to_frame().to_parquet(path)
     stamps = pd.to_datetime(stamps)
 
-    # Reports released after the 16:00 close move the stock on the next session.
+    # reports released after the 16:00 close move the stock on the next session.
     after_close = (stamps.dt.hour >= 16).astype(int)
     reaction = pd.DatetimeIndex(stamps.dt.normalize() + pd.to_timedelta(after_close, unit="D")).as_unit(index.unit)
     positions = index.searchsorted(reaction)  # first trading day on or after the reaction date
+    # reports that haven't happened yet land past the last row: count how many business days away they are.
     future = positions >= len(index)
     last_day = np.datetime64(index[-1].date(), "D")
     positions[future] = len(index) - 1 + np.busday_count(last_day, reaction[future].to_numpy().astype("datetime64[D]"))
@@ -88,7 +91,8 @@ def earnings_reaction_positions(ticker, index):
 
 
 def earnings_timing(ticker, index):
-    """For every row: trading days until the next earnings reaction, and since the last one."""
+    """for every row: trading days until the next earnings reaction, and since the last one."""
+    # for each row, find the next earnings reaction day after it and the last one before it.
     rows = np.arange(len(index))
     reactions = np.append(earnings_reaction_positions(ticker, index), 10 ** 9)  # sentinel = "no next report"
     next_i = np.searchsorted(reactions, rows, side="right")  # first reaction strictly after each row
@@ -99,7 +103,8 @@ def earnings_timing(ticker, index):
 
 
 def frame(ticker, news=True):
-    """Features and targets for one ticker. news=False skips the (slower) news features."""
+    """features and targets for one ticker. news=false skips the (slower) news features."""
+    # daily prices for the stock, the whole market (SPY) and the market's fear index (VIX).
     stock, spy, vix = prices(ticker), prices("SPY"), prices("^VIX")
     close = stock["Close"]
     returns = close.pct_change()
@@ -107,6 +112,7 @@ def frame(ticker, news=True):
     vix_level = vix["Close"].reindex(stock.index).ffill()
     days_to, days_since = earnings_timing(ticker, stock.index)
 
+    # the targets for each horizon: was the coming period wilder than this stock's normal?
     X = pd.DataFrame(index=stock.index)
     turbulent, persistence, log_vol_ratio = {}, {}, {}
     for h in HORIZONS:
@@ -118,7 +124,7 @@ def frame(ticker, news=True):
         persistence[h] = past > normal
         X[f"earn_in_{h}"] = ((days_to >= 1) & (days_to <= h)).astype(float)  # earnings within the window?
 
-    # Volatility features, all relative to "normal" so different stocks are comparable.
+    # volatility features, all relative to "normal" so different stocks are comparable.
     normal20 = realised_vol(returns, 20).rolling(TRADING_DAYS_PER_YEAR).median()
     for window in (1, 5, 20, 60):
         X[f"rv{window}"] = np.log(realised_vol(returns, window) / normal20 + 1e-6)
@@ -132,8 +138,10 @@ def frame(ticker, news=True):
     X["mom20"] = close.pct_change(20)
     X["ma200_gap"] = close / close.rolling(200).mean() - 1
 
+    # drop broken values and early days without a full year of history, and start in 2011.
     X = X.replace([np.inf, -np.inf], np.nan).dropna()
     X = X[X.index >= "2011-01-01"]
+    # line the targets up with the rows that are left.
     data = TickerData(
         X,
         pd.DataFrame(turbulent).reindex(X.index),
@@ -143,7 +151,7 @@ def frame(ticker, news=True):
     if not news:
         return data
 
-    # News: headline volume, and the volatility that followed the most similar past headline days.
+    # news: headline volume, and the volatility that followed the most similar past headline days.
     nf = news_features(ticker, X, data.log_vol_ratio)
     X["news_count"] = nf["news_count"]
     for h in HORIZONS:
@@ -152,19 +160,21 @@ def frame(ticker, news=True):
 
 
 # ===========================================================================
-# Models
+# models
 # ===========================================================================
 
+# a model = which estimator, which features, and whether it learns from all four stocks at once.
 @dataclass
 class Model:
     estimator: str  # see make_estimator()
     features: str = "all"  # "all", "no_news", "vix", "har" or "har+"; see feature_columns()
-    pooled: bool = False  # True: one model trained on all four tickers' rows
+    pooled: bool = False  # true: one model trained on all four tickers' rows
 
 
 CLASSIFIERS = ("logistic", "hgb", "random_forest", "extra_trees", "ensemble")
 REGRESSORS = ("ols", "ridge", "elastic_net", "hgb_regression")  # fit log_vol_ratio instead of turbulent
 
+# all 17 model variants we compared. the dashboard uses "Pooled logistic, no news".
 MODELS = {
     "VIX-only logistic": Model("logistic", features="vix"),
     "Logistic": Model("logistic"),
@@ -178,7 +188,7 @@ MODELS = {
     "Pooled random forest": Model("random_forest", pooled=True),
     "Pooled ensemble": Model("ensemble", pooled=True),
     "Pooled logistic, no news": Model("logistic", features="no_news", pooled=True),  # the dashboard's live model
-    # Regressions on the continuous log volatility ratio; "turbulent" when the prediction is above 0.
+    # regressions on the continuous log volatility ratio; "turbulent" when the prediction is above 0.
     "HAR regression": Model("ols", features="har", pooled=True),  # textbook HAR: daily/weekly/monthly vol
     "HAR + VIX + earnings": Model("ols", features="har+", pooled=True),
     "Ridge regression": Model("ridge", pooled=True),
@@ -188,7 +198,7 @@ MODELS = {
 
 
 def make_estimator(name):
-    """A fresh, untrained scikit-learn model."""
+    """a fresh, untrained scikit-learn model."""
     if name == "logistic":
         return make_pipeline(StandardScaler(), LogisticRegression(C=0.1, max_iter=2000))
     if name == "hgb":
@@ -212,14 +222,14 @@ def make_estimator(name):
 
 
 def feature_columns(X, h, features="all"):
-    """Which columns a model uses at horizon h."""
+    """which columns a model uses at horizon h."""
     if features == "vix":
         return ["vix", "spy_rv20", "rv20"]
     if features == "har":
         return ["rv1", "rv5", "rv20"]
     if features == "har+":
         return ["rv1", "rv5", "rv20", "vix", f"earn_in_{h}"]
-    # Every feature, but only this horizon's earnings flag and news forecast.
+    # every feature, but only this horizon's earnings flag and news forecast.
     cols = [c for c in X if not c.startswith(("earn_in_", "knn_vol_"))] + [f"earn_in_{h}"]
     if features == "no_news":
         return [c for c in cols if c != "news_count"]
@@ -227,8 +237,8 @@ def feature_columns(X, h, features="all"):
 
 
 def predict_turbulence(estimator, X_train, y_train, X_eval):
-    """Train and return a score per row where > 0.5 means 'turbulent'.
-    Classifiers return P(turbulent). Regressors predict the log volatility ratio and return
+    """train and return a score per row where > 0.5 means 'turbulent'.
+    classifiers return p(turbulent). regressors predict the log volatility ratio and return
     0.5 + prediction, so the 0.5 threshold and the AUC ranking still apply."""
     if estimator == "ensemble":
         return np.mean([predict_turbulence(e, X_train, y_train, X_eval) for e in ("logistic", "hgb", "random_forest")], axis=0)
@@ -240,17 +250,19 @@ def predict_turbulence(estimator, X_train, y_train, X_eval):
 
 
 # ===========================================================================
-# Evaluation
+# evaluation
 # ===========================================================================
 
 def periods(test):
+    """the date ranges we score: one per validation year, or just the test period."""
     if test:
         return [TEST]
     return [(pd.Timestamp(f"{y}-01-01"), pd.Timestamp(f"{y + 1}-01-01")) for y in VAL_YEARS]
 
 
 def split_rows(d, h, start, end):
-    """Training rows (before `start`, last h purged) and scored rows (every h-th day in the period)."""
+    """training rows (before `start`, last h purged) and scored rows (every h-th day in the period)."""
+    # only rows whose future is known can be used for training or scoring.
     has_label = d.turbulent[h].notna().to_numpy()
     train = np.flatnonzero((d.X.index < start) & has_label)[:-h]
     scored = np.flatnonzero((d.X.index >= start) & (d.X.index < end) & has_label)[::h]
@@ -258,10 +270,13 @@ def split_rows(d, h, start, end):
 
 
 def baseline_results(data, splits, h, year):
+    """score the two simple baselines for every ticker: always guess the more common label, and same as the last h days."""
     rows = []
     for t, d in data.items():
         train, scored = splits[t]
         actual = d.turbulent[h].iloc[scored].astype(bool).to_numpy()
+        # baseline 1: always guess whichever label was more common in training.
+        # baseline 2 (persistence): guess that the next h days will be like the last h days.
         majority = d.turbulent[h].iloc[train].mean() > 0.5
         for name, guess in [("Majority class", np.full(len(scored), majority)),
                             ("Persistence (last h days)", d.persistence[h].iloc[scored].to_numpy())]:
@@ -271,14 +286,16 @@ def baseline_results(data, splits, h, year):
 
 
 def model_scores(spec, data, splits, h):
-    """Scores for every ticker's scored rows: from one pooled model, or one model per ticker."""
+    """scores for every ticker's scored rows: from one pooled model, or one model per ticker."""
     cols = feature_columns(data[TICKERS[0]].X, h, spec.features)
     regression = spec.estimator in REGRESSORS
 
     def training_data(d, rows):
+        """the features plus the right target: turbulent yes/no for classifiers, the volatility ratio for regressions."""
         target = d.log_vol_ratio[h] if regression else d.turbulent[h].astype(bool)
         return d.X[cols].iloc[rows], target.iloc[rows]
 
+    # the rows we will score, one table per stock.
     eval_frames = [data[t].X[cols].iloc[splits[t][1]] for t in TICKERS]
     if spec.pooled:  # fit once on all tickers' training rows, then split the scores back per ticker
         parts = [training_data(data[t], splits[t][0]) for t in TICKERS]
@@ -286,32 +303,38 @@ def model_scores(spec, data, splits, h):
         y_train = pd.concat([p[1] for p in parts])
         scores = predict_turbulence(spec.estimator, X_train, y_train, pd.concat(eval_frames))
         return np.split(scores, np.cumsum([len(f) for f in eval_frames])[:-1])
+    # not pooled: train a separate model for each stock.
     return [predict_turbulence(spec.estimator, *training_data(data[t], splits[t][0]), frame_)
             for t, frame_ in zip(TICKERS, eval_frames)]
 
 
 def run(models, horizons, test=False):
-    """Score the baselines and every model in `models`. One result row per ticker, horizon and period."""
+    """score the baselines and every model in `models`. one result row per ticker, horizon and period."""
+    # build features for all four stocks once, then reuse them for every model.
     data = {t: frame(t) for t in TICKERS}
     rows = []
     for h in horizons:
         for start, end in periods(test):
+            # for this horizon and period: which rows to train on and which to score.
             splits = {t: split_rows(d, h, start, end) for t, d in data.items()}
             rows += baseline_results(data, splits, h, start.year)
             for name in models:
                 for t, scores in zip(TICKERS, model_scores(MODELS[name], data, splits, h)):
                     actual = data[t].turbulent[h].iloc[splits[t][1]].astype(bool).to_numpy()
+                    # a "hit" = the model said turbulent (score > 0.5) and it was, or calm and it was.
                     rows.append(dict(model=name, h=h, ticker=t, year=start.year, n=len(scores),
                                      hits=int(((scores > 0.5) == actual).sum()), proba=list(scores), y=list(actual)))
     return pd.DataFrame(rows)
 
 
 def summarize(results):
-    """Accuracy, its standard error, AUC and per-ticker accuracy for each (horizon, model)."""
+    """accuracy, its standard error, AUC and per-ticker accuracy for each (horizon, model)."""
     out = []
     for (h, model), g in results.groupby(["h", "model"], sort=False):
         n = g.n.sum()
+        # accuracy = correct calls / all calls.
         accuracy = g.hits.sum() / n
+        # AUC: pick one turbulent and one calm week at random; how often does the model rate the turbulent one higher?
         auc = roc_auc_score(sum(g.y, []), sum(g.proba, [])) if g.proba.notna().all() else np.nan
         per_ticker = (g.groupby("ticker").hits.sum() / g.groupby("ticker").n.sum()).round(3)
         out.append(dict(h=h, model=model, n=n, accuracy=accuracy, se=np.sqrt(accuracy * (1 - accuracy) / n),
@@ -320,16 +343,17 @@ def summarize(results):
 
 
 # ===========================================================================
-# Live outlook for the dashboard
+# live outlook for the dashboard
 # ===========================================================================
 
-# Measured accuracy of the live model ("Pooled logistic, no news") at h=5; see docs/VOLATILITY.md.
-# Baseline = persistence ("same as the last 5 days") on the same test set.
+# measured accuracy of the live model ("Pooled logistic, no news") at h=5; see docs/VOLATILITY.md.
+# baseline = persistence ("same as the last 5 days") on the same test set.
 LIVE_ACCURACY = {"validation_accuracy": 0.682, "test_accuracy": 0.764, "baseline_test_accuracy": 0.665}
 
 
 def typical_moves(ticker, h):
-    """Descriptive move sizes from the last 3 years of prices (not model outputs)."""
+    """descriptive move sizes from the last 3 years of prices (not model outputs)."""
+    # last 3 years (756 trading days): how big daily moves were in turbulent vs calm weeks.
     returns = prices(ticker)["Close"].pct_change()
     week_vol = realised_vol(returns, h).iloc[-756:]
     turbulent = week_vol > realised_vol(returns, h).rolling(TRADING_DAYS_PER_YEAR).median().iloc[-756:]
@@ -342,8 +366,10 @@ def typical_moves(ticker, h):
 
 
 def outlook(h=5):
-    """Turbulence outlook for each ticker as of the latest close. Trains the pooled logistic model
+    """turbulence outlook for each ticker as of the latest close. trains the pooled logistic model
     (no news features) on every day whose h-day outcome is already known."""
+    # train on every day so far whose 5-day outcome is already known. news features are off
+    # because live news counts aren't comparable to the historical ones.
     data = {t: frame(t, news=False) for t in TICKERS}
     cols = feature_columns(data[TICKERS[0]].X, h, "no_news")
     known = [d.turbulent[h].notna() for d in data.values()]
@@ -352,6 +378,7 @@ def outlook(h=5):
     model = make_estimator("logistic").fit(X_train, y_train)
 
     out = {}
+    # score today's row for each stock and package the drivers for the page.
     for t, d in data.items():
         today = d.X[cols].iloc[[-1]]
         days_to = today.days_to_earn.iloc[0]
@@ -371,6 +398,7 @@ def outlook(h=5):
     return out
 
 
+# command line: validation for every model, or one --test run.
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--test", nargs=2, metavar=("MODEL", "HORIZON"), help="score one model once on 2022-2023")

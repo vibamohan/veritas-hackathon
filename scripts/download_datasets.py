@@ -1,10 +1,10 @@
-"""Rebuild data/datasets/*.csv (date, title, url, source, ticker) from the raw datasets.
+"""rebuild data/datasets/*.csv (date, title, url, source, ticker) from the raw datasets.
 
-The CSVs are committed, so collaborators only need this to refresh or change the data.
-Hugging Face and Fliar BI download automatically; Kaggle needs a login, so save its ZIP
+the CSVs are committed, so collaborators only need this to refresh or change the data.
+hugging face and fliar BI download automatically; kaggle needs a login, so save its ZIP
 as data/datasets/kaggle.zip first (otherwise the existing kaggle.csv is kept).
 
-Usage: uv run python scripts/download_datasets.py
+usage: uv run python scripts/download_datasets.py
 """
 import io
 import sys
@@ -17,6 +17,7 @@ import requests
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from echomarket import TICKERS, mentions
 
+# where the filtered CSVs go, and where each original dataset is downloaded from.
 DEST = Path("data/datasets")
 HF = "https://huggingface.co/datasets/oliverwang15/us_stock_news_with_price/resolve/main/data/{}-00000-of-00001.parquet"
 FLIARBI = "https://huggingface.co/datasets/fliarbi/corporate-events-2019-2026/resolve/main/data/train.parquet"
@@ -24,7 +25,7 @@ KAGGLE_PAGE = "https://www.kaggle.com/datasets/miguelaenlle/massive-stock-news-a
 
 
 def get(url):
-    """Download a file into memory."""
+    """download a file into memory."""
     print("downloading", url)
     response = requests.get(url, timeout=600)
     response.raise_for_status()
@@ -32,8 +33,8 @@ def get(url):
 
 
 def save(df, name):
-    """Keep only rows about our tickers and write data/datasets/<name>.csv.
-    A row belongs to a ticker if the dataset tags it with that ticker OR its headline names it
+    """keep only rows about our tickers and write data/datasets/<name>.csv.
+    a row belongs to a ticker if the dataset tags it with that ticker OR its headline names it
     (so a headline can be kept for several tickers)."""
     per_ticker = []
     for t in TICKERS:
@@ -46,16 +47,18 @@ def save(df, name):
     print(f"saved {len(df)} rows to {DEST / name}.csv:", df.ticker.value_counts().to_dict())
 
 
-# Each loader renames the source's columns to: date, ticker, title, url, source.
+# each loader renames the source's columns to: date, ticker, title, url, source.
 
 def huggingface():
+    """download the hugging face news dataset and keep our tickers."""
     cols = {"date": "date", "stock": "ticker", "title": "title"}
     df = pd.concat(pd.read_parquet(get(HF.format(s)), columns=list(cols)) for s in ("train", "test"))
     save(df.rename(columns=cols).assign(url="", source="huggingface"), "huggingface")
 
 
 def kaggle():
-    # Kaggle needs a login: download the ZIP from KAGGLE_PAGE and save it as data/datasets/kaggle.zip
+    # kaggle needs a login: download the ZIP from KAGGLE_PAGE and save it as data/datasets/kaggle.zip
+    """read the kaggle zip you downloaded by hand (it needs a login) and keep our tickers."""
     path = DEST / "kaggle.zip"
     if not path.exists():
         print(f"skipping Kaggle: download the ZIP from {KAGGLE_PAGE} and save it as {path}")
@@ -69,12 +72,14 @@ def kaggle():
 
 
 def fliarbi():
-    # Free 7% sample (CC BY-NC 4.0). Rows have no ticker, so only headline mentions count.
+    # free 7% sample (CC BY-NC 4.0). rows have no ticker, so only headline mentions count.
+    """download the free fliar BI sample and keep headlines that name our companies."""
     d = pd.read_parquet(get(FLIARBI), columns=["event_date", "headline", "news_url", "news_source"])
     d.columns = ["date", "title", "url", "source"]
     save(d.assign(ticker=""), "fliarbi")
 
 
+# rebuild all three CSVs (kaggle is skipped unless its zip is there).
 if __name__ == "__main__":
     DEST.mkdir(parents=True, exist_ok=True)
     huggingface()

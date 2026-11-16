@@ -1,13 +1,13 @@
-"""Does the news half of the model help? Point-in-time validation on 2020-2021.
+"""does the news half of the model help? point-in-time validation on 2020-2021.
 
-Same split as /api/replay: train through 2019, validate 2020-2021 (every 5 trading
-days), five-row purge at boundaries, 2022+ untouched. For each validation date t:
+same split as /api/replay: train through 2019, validate 2020-2021 (every 5 trading
+days), five-row purge at boundaries, 2022+ untouched. for each validation date t:
   - "today's story" = the 10 newest headlines from the 7 days before t (strictly before t,
     so nothing published after the forecast is made),
   - candidates = past days whose 5-day outcome had finished by t,
   - TF-IDF vocabulary is fit on pre-2020 headlines only.
 
-Usage: uv run python scripts/evaluate.py [TICKER ...]
+usage: uv run python scripts/evaluate.py [TICKER ...]
 """
 import sys
 from pathlib import Path
@@ -20,16 +20,18 @@ from sklearn.metrics.pairwise import cosine_similarity
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from echomarket import FEATURES, TICKERS, dataset_news, market_frame, ridge_model, webhose_news
 
+# train on everything before 2020, then check the forecasts on 2020-21.
 TRAIN_END, VAL_END = pd.Timestamp("2020-01-01"), pd.Timestamp("2022-01-01")
 TOP_K, NEWS_WEIGHT, H = 15, 0.3, 5  # same constants as forecast_bundle
 
 
 def join_headlines(titles):
+    """glue one day's headlines into a single block of text."""
     return " ".join(titles.astype(str))
 
 
 def score(pred, actual):
-    """Mean absolute error, direction hit rate, and correlation of forecasts with outcomes."""
+    """mean absolute error, direction hit rate, and correlation of forecasts with outcomes."""
     pred, actual = np.asarray(pred), np.asarray(actual)
     hit = [np.sign(p) == np.sign(a) for p, a in zip(pred, actual) if p != 0]
     corr = np.corrcoef(pred, actual)[0, 1] if np.ptp(pred) > 0 else np.nan  # undefined for a constant
@@ -37,22 +39,28 @@ def score(pred, actual):
 
 
 def evaluate(ticker):
+    """score always-up, the price model, news-only and the 70/30 blend on 2020-21 for one ticker."""
+    # step 1: the price model, trained once on pre-2020 data.
     f = market_frame(ticker).dropna()
     row_of = {day: i for i, day in enumerate(f.index)}
-    train = np.flatnonzero(f.index < TRAIN_END)[: -H]  # purge the last H rows before the boundary
+    train = np.flatnonzero(f.index < TRAIN_END)[: -H]  # purge the last h rows before the boundary
     val = np.flatnonzero((f.index >= TRAIN_END) & (f.index < VAL_END))[H:-H:H]  # every 5th day
     model = ridge_model(1.0).fit(f[FEATURES].iloc[train], f.target5.iloc[train])
     price = model.predict(f[FEATURES].iloc[val])
 
-    # Historical news only (GDELT is live-only, so it can't be replayed).
+    # historical news only (GDELT is live-only, so it can't be replayed).
     news = pd.concat([dataset_news(ticker), webhose_news(ticker)], ignore_index=True).drop_duplicates("title")
     news["date"] = pd.to_datetime(news.date)
     news["day"] = news.date.dt.normalize()
+    # step 2: one block of headline text per trading day, turned into TF-IDF word weights
+    # (the vocabulary only comes from pre-2020 headlines, so nothing leaks from the future).
     day_docs = news[news.day.isin(f.index)].groupby("day").title.apply(join_headlines)  # one text per day
     tfidf = TfidfVectorizer(max_features=3000, stop_words="english").fit(day_docs[day_docs.index < TRAIN_END])
     day_vectors = tfidf.transform(day_docs)
     day_rows = np.array([row_of[d] for d in day_docs.index])
 
+    # step 3: for each forecast day, compare the last week's headlines with older days whose
+    # outcome was already known, and average what happened after the closest 15.
     news_pred, covered = [], 0
     for i, price_forecast in zip(val, price):
         t = f.index[i]
@@ -69,6 +77,7 @@ def evaluate(ticker):
         news_pred.append(np.average(outcomes, weights=np.maximum(sims[top], 0.001)))
 
     news_pred, actual = np.array(news_pred), f.target5.iloc[val].to_numpy()
+    # step 4: score all four approaches on the same days.
     rows = {
         "Always up (+1%)": score(np.full(len(val), 0.01), actual),
         "Price model": score(price, actual),
