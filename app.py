@@ -4,12 +4,14 @@
   /api/dashboard  prices, headlines, turbulence outlook and the experimental direction forecast
   /api/replay     the direction model's validation results (train through 2019, validate 2020–21)
 
-Speed: each ticker's /api/dashboard and /api/replay response is cached in memory for 10 minutes,
-and all four tickers are computed in a background thread when the server starts, so switching
-tickers in the dashboard doesn't wait for downloads or model training.
+Speed and reliability: /api/dashboard and /api/replay responses are cached in memory. A background
+thread fills the cache for the four preset tickers shortly after startup and refreshes it every
+10 minutes. Computations run in a small background pool, and a request never waits more than
+45 seconds: it gets cached data or a "still loading" (503) reply that the page retries.
 
 Run with:  uv run python app.py   then open http://127.0.0.1:5000
-Set ECHOMARKET_WARMUP=0 to skip the startup pre-loading (e.g. in tests).
+Set ECHOMARKET_WARMUP=0 to skip the startup pre-loading (e.g. in tests), and
+ECHOMARKET_WARMUP_DELAY to change how long it waits after startup (default 20 seconds).
 """
 import os
 import threading
@@ -27,28 +29,63 @@ app = Flask(__name__, static_folder="frontend/dist", static_url_path="")
 
 
 # ---------------------------------------------------------------------------
-# Caching
+# Caching and background computation
+#
+# Heavy work (downloads, model training) never runs on the threads that answer requests. It runs
+# in a small pool of COMPUTE_WORKERS threads, and a request waits at most REQUEST_WAIT seconds for it.
+# If a download is slow or stuck (e.g. Yahoo rate-limiting the server), visitors get the last known
+# data or a "still loading" reply instead of a frozen site, and /api/health always answers.
 # ---------------------------------------------------------------------------
 
-RESPONSE_TTL = 600  # seconds a computed response is reused
+RESPONSE_TTL = 1800  # seconds a computed response counts as fresh
+REFRESH_EVERY = 600  # seconds between background refreshes of the 4 preset tickers
+REQUEST_WAIT = 45  # max seconds a request waits for a computation before replying "still loading"
+COMPUTE_WORKERS = 2  # parallel computations (Render's free tier has 0.1 CPU and 512 MB)
+
+_compute_pool = ThreadPoolExecutor(max_workers=COMPUTE_WORKERS, thread_name_prefix="compute")
 _responses = {}  # (endpoint, ticker) -> (computed_at, payload)
-_response_locks = {}  # (endpoint, ticker) -> lock; created on first use (custom tickers are allowed)
-_locks_guard = threading.Lock()
+_running = {}  # (endpoint, ticker) -> Future of the computation in progress
+_running_lock = threading.Lock()
+
+
+def log(message):
+    print(f"[echomarket] {message}", flush=True)  # shows up in the Render log
+
+
+def _compute_and_store(key, compute):
+    endpoint, ticker = key
+    started = time.time()
+    try:
+        payload = compute(ticker)
+    except Exception as error:
+        log(f"{endpoint} {ticker} failed after {time.time() - started:.1f}s: {error}")
+        raise
+    _responses[key] = (time.time(), payload)
+    log(f"{endpoint} {ticker} computed in {time.time() - started:.1f}s")
+    return payload
+
+
+def start_compute(endpoint, ticker, compute):
+    """Start (re)computing a response in the background pool, unless it's already running."""
+    key = (endpoint, ticker)
+    with _running_lock:
+        future = _running.get(key)
+        if future is None or future.done():
+            future = _compute_pool.submit(_compute_and_store, key, compute)
+            _running[key] = future
+        return future
 
 
 def cached_response(endpoint, ticker, compute):
-    """Return the cached payload if it's recent, otherwise compute and cache it.
-    The lock makes a second request for the same ticker wait for the first instead of duplicating work."""
-    key = (endpoint, ticker)
-    with _locks_guard:
-        lock = _response_locks.setdefault(key, threading.Lock())
-    with lock:
-        hit = _responses.get(key)
-        if hit and time.time() - hit[0] < RESPONSE_TTL:
-            return hit[1]
-        payload = compute(ticker)
-        _responses[key] = (time.time(), payload)
-        return payload
+    """Fresh cached payload if there is one. Otherwise start a recomputation and either return the
+    older payload right away, or wait up to REQUEST_WAIT seconds (raises TimeoutError after that)."""
+    hit = _responses.get((endpoint, ticker))
+    if hit and time.time() - hit[0] < RESPONSE_TTL:
+        return hit[1]
+    future = start_compute(endpoint, ticker, compute)
+    if hit:
+        return hit[1]  # slightly old data now; the next visitor gets the refreshed version
+    return future.result(timeout=REQUEST_WAIT)
 
 
 _outlook = {"computed_at": 0.0, "by_ticker": {}}
@@ -58,31 +95,40 @@ _outlook_lock = threading.Lock()
 def turbulence(ticker):
     """5-day turbulence outlook from scripts/volatility.py, recomputed at most once an hour
     (it trains on all four tickers at once). Returns None if it can't be computed."""
+    if not _outlook_lock.acquire(timeout=REQUEST_WAIT):  # another thread is (slowly) computing it
+        return _outlook["by_ticker"].get(ticker)
     try:
-        with _outlook_lock:
-            if time.time() - _outlook["computed_at"] > 3600:
-                from scripts.volatility import outlook  # imported lazily: only needed for the dashboard
+        if time.time() - _outlook["computed_at"] > 3600:
+            from scripts.volatility import outlook  # imported lazily: only needed for the dashboard
 
-                _outlook.update(computed_at=time.time(), by_ticker=outlook())
+            started = time.time()
+            _outlook.update(computed_at=time.time(), by_ticker=outlook())
+            log(f"turbulence outlook computed in {time.time() - started:.1f}s")
         return _outlook["by_ticker"].get(ticker)
     except Exception as error:
-        app.logger.warning("turbulence outlook unavailable: %s", error)
+        log(f"turbulence outlook unavailable: {error}")
         return None
+    finally:
+        _outlook_lock.release()
 
 
-def warm_up_ticker(ticker):
-    for endpoint, compute in (("dashboard", dashboard_payload), ("replay", replay_payload)):
-        try:
-            cached_response(endpoint, ticker, compute)
-        except Exception as error:
-            app.logger.warning("warm-up failed for %s %s: %s", endpoint, ticker, error)
+WARMUP_DELAY = int(os.environ.get("ECHOMARKET_WARMUP_DELAY", "20"))  # seconds
 
 
-def warm_up():
-    """Compute every ticker's responses in the background (in parallel), so the first clicks are fast."""
-    prices("SPY")  # shared by every ticker: download once before the parallel work starts
-    with ThreadPoolExecutor(max_workers=len(TICKERS)) as pool:
-        list(pool.map(warm_up_ticker, TICKERS))
+def keep_warm():
+    """Background loop: fill the cache for the 4 preset tickers, then refresh it every 10 minutes.
+    Gentle on purpose for small hosts: it waits until the server is answering requests and health
+    checks, then refreshes one response at a time. Visitors keep getting the previous responses
+    while a refresh runs."""
+    time.sleep(WARMUP_DELAY)
+    while True:
+        for ticker in TICKERS:
+            for endpoint, compute in (("dashboard", dashboard_payload), ("replay", replay_payload)):
+                try:
+                    start_compute(endpoint, ticker, compute).result(timeout=300)
+                except Exception as error:  # includes a timeout: move on, try again next round
+                    log(f"background refresh of {endpoint} {ticker} did not finish: {error!r}")
+        time.sleep(REFRESH_EVERY)
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +268,12 @@ def health():
     return jsonify({"ok": True, "tickers": TICKERS, "custom_tickers": True})
 
 
+def still_loading(ticker):
+    """503 reply telling the page to retry shortly (the computation keeps running meanwhile)."""
+    return jsonify({"error": f"Still loading {ticker}: the server is busy downloading data. Retrying…",
+                    "loading": True}), 503
+
+
 @app.get("/api/dashboard")
 def dashboard():
     ticker = requested_ticker()
@@ -229,6 +281,8 @@ def dashboard():
         return jsonify({"error": "Unsupported ticker"}), 400
     try:
         return jsonify(cached_response("dashboard", ticker, dashboard_payload))
+    except TimeoutError:
+        return still_loading(ticker)
     except Exception as error:
         return jsonify({"error": str(error)}), 502
 
@@ -240,6 +294,8 @@ def replay():
         return jsonify({"error": "Unsupported ticker"}), 400
     try:
         return jsonify(cached_response("replay", ticker, replay_payload))
+    except TimeoutError:
+        return still_loading(ticker)
     except NotEnoughHistory as error:
         return jsonify({"error": str(error)}), 422
     except Exception as error:
@@ -248,7 +304,7 @@ def replay():
 
 # Start pre-loading as soon as the module is imported (by `python app.py` or by gunicorn).
 if os.environ.get("ECHOMARKET_WARMUP", "1") != "0":
-    threading.Thread(target=warm_up, daemon=True).start()
+    threading.Thread(target=keep_warm, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=False)

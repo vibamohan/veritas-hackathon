@@ -151,11 +151,23 @@ function drawReplayChart(forecasts) {
 // App: state, data loading, layout
 // ---------------------------------------------------------------------------
 
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// GET a JSON endpoint. If the server says it's still loading (HTTP 503 with loading: true, e.g. right
+// after the free Render server wakes up), wait 5 seconds and try again, for up to about 2 minutes.
 async function fetchJson(url) {
-  const response = await fetch(url);
-  const body = await response.json();
-  if (!response.ok) throw Error(body.error);
-  return body;
+  for (let attempt = 0; ; attempt++) {
+    const response = await fetch(url);
+    const body = await response.json();
+    if (response.ok) return body;
+    if (response.status === 503 && body.loading && attempt < 24) {
+      await wait(5000);
+      continue;
+    }
+    throw Error(body.error);
+  }
 }
 
 // Both endpoints for one ticker, requested in parallel.
